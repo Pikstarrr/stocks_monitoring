@@ -20,6 +20,8 @@ jobs:
       - name: Decode Firebase credentials
         run: |
           echo "$FIREBASE_CREDENTIALS" | base64 --decode > stock-monitoring-fb.json
+        env:
+          FIREBASE_CREDENTIALS: ${{secrets.FIREBASE_CREDENTIALS}}
       - name: Verify Firebase JSON File Content
         run: cat stock-monitoring-fb.json
       - name: Run the script
