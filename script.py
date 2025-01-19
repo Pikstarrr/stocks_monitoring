@@ -1,9 +1,7 @@
-import requests
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from firebase_admin import credentials, firestore, initialize_app
 import dhanhq
+import os
+from dotenv import load_dotenv
 
 from send_mail import send_email
 
@@ -13,8 +11,11 @@ initialize_app(cred)
 db = firestore.client()
 doc_ref = db.collection("stock_data").document("values")
 
-CLIENT_ID = "1105995499"
-ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzM5ODc5NjU2LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNTk5NTQ5OSJ9.yZTzZoNO4_Is1Bm0QB8rvyduXR04vtUi-4H-D4VHMnDCgQpOTt6n0juPkvvfyLnFjUTsUK2if1SdR1rwuOCKFw"
+# CLIENT_ID = os.environ["DHAN_CLIENT_ID"]
+# ACCESS_TOKEN = os.environ["DHAN_API_KEY"]
+load_dotenv()
+CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
+ACCESS_TOKEN = os.getenv("DHAN_API_KEY")
 
 security_ids = [
     10417, 10905, 11195, 1134, 11626, 11987, 13359, 13966, 14908, 15179,
@@ -51,7 +52,7 @@ def update_value_in_db_and_user():
 
     if current_value > highest_value:
         highest_value = current_value
-        doc_ref.set({"highestValue": highest_value})
+        doc_ref.set({"highest_value": highest_value})
     elif (highest_value - current_value) / highest_value > 0.05:
         send_email(
             "Stock Alert: Significant Drop",

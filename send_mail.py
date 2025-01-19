@@ -1,9 +1,14 @@
 import smtplib
 from email.mime.text import MIMEText
+import os
 
-EMAIL = "prasad0kulkarni.pk@gmail.com"
-PASSWORD = "xies knqi leps oaos"
-RECIPIENT = "prasad0kulkarni.pk@gmail.com"
+# EMAIL = os.environ["SENDER_EMAIL"]
+# PASSWORD = os.environ["MAIL_PASSWORD"]
+# RECIPIENT = os.environ["RECEIVER_MAIL"]
+
+EMAIL = os.getenv("SENDER_EMAIL")
+PASSWORD = os.getenv("MAIL_PASSWORD")
+RECIPIENT = os.getenv("RECEIVER_MAIL")
 
 def send_email(subject, body):
     msg = MIMEText(body)
