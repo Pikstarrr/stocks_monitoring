@@ -3,6 +3,7 @@ name: Stock Monitor
 on:
   schedule:
     - cron: "*/5 3-10 * * 1-5" # Every 5 minutes, Monday-Friday, 9 AM - 4 PM
+  workflow_dispatch:
 
 jobs:
   monitor:
@@ -16,10 +17,14 @@ jobs:
           python-version: "3.9"
       - name: Install dependencies
         run: pip install -r requirements.txt
+      - name: Decode Firebase credentials
+        run: |
+          echo "$FIREBASE_CREDENTIALS" | base64 --decode > stock-monitoring-fb.json
       - name: Run the script
         env:
           EMAIL: ${{ secrets.EMAIL }}
           PASSWORD: ${{ secrets.PASSWORD }}
           RECIPIENT: ${{ secrets.RECIPIENT }}
           API_KEY: ${{ secrets.API_KEY }}
+          GOOGLE_APPLICATION_CREDENTIALS: stock-monitoring-fb.json
         run: python script.py
