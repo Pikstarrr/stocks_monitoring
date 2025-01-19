@@ -18,17 +18,18 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
       - name: Decode Firebase credentials
+        env:
+          FIREBASE_CREDENTIALS: ${{ secrets.FIREBASE_CREDENTIALS }}
         run: |
           echo "$FIREBASE_CREDENTIALS" | base64 --decode > stock-monitoring-fb.json
-        env:
-          FIREBASE_CREDENTIALS: ${{secrets.FIREBASE_CREDENTIALS}}
       - name: Verify Firebase JSON File Content
         run: cat stock-monitoring-fb.json
       - name: Run the script
         env:
-          EMAIL: ${{ secrets.EMAIL }}
-          PASSWORD: ${{ secrets.PASSWORD }}
-          RECIPIENT: ${{ secrets.RECIPIENT }}
-          API_KEY: ${{ secrets.API_KEY }}
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+          RECEIVER_MAIL: ${{ secrets.RECEIVER_MAIL }}
+          DHAN_API_KEY: ${{ secrets.DHAN_API_KEY }}
+          DHAN_CLIENT_ID: ${{ secrets.DHAN_CLIENT_ID }}
           GOOGLE_APPLICATION_CREDENTIALS: stock-monitoring-fb.json
         run: python script.py
