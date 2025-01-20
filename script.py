@@ -30,7 +30,7 @@ def calculate_current_value(stocks_current_prices):
     total_low = 0.0
     for key, value in stocks_current_prices:
         total_high += value["ohlc"]["high"]
-        total_high += value["ohlc"]["low"]
+        total_low += value["ohlc"]["low"]
     return total_high, total_low
 
 
@@ -66,7 +66,7 @@ def update_value_in_db_and_user():
             "Stock Alert: Significant Drop",
             f"Current Value: {current_low_value}, Highest Value: {current_highest_value}",
         )
-        doc_ref.set({"highestValue": current_highest_value})
+        doc_ref.set({"highest_value": current_highest_value})
 
 
 # Run Script
