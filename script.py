@@ -56,8 +56,6 @@ def update_value_in_db_and_user():
     doc = doc_ref.get()
     current_highest_value = doc.to_dict().get("highest_value", 0.0) if doc.exists else 0.0
 
-    print(current_high_value, current_high_value, current_highest_value)
-
     if current_high_value > current_highest_value:
         current_highest_value = current_high_value
         doc_ref.set({"highest_value": current_highest_value})
@@ -67,6 +65,8 @@ def update_value_in_db_and_user():
             f"Current Value: {current_low_value}, Highest Value: {current_highest_value}",
         )
         doc_ref.set({"highest_value": current_highest_value})
+
+    print(current_high_value, current_high_value, current_highest_value)
 
 
 # Run Script
