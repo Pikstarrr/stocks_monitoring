@@ -2,7 +2,7 @@ name: Stock Monitor
 
 on:
   schedule:
-    - cron: "*/5 3-10 * * 1-5" # Every 5 minutes, Monday-Friday, 9 AM - 4 PM
+    - cron: "*/5 3.10-9.25 * * 1-5" # Every 5 minutes, Monday-Friday, 9 AM - 4 PM
   workflow_dispatch:
 
 jobs:

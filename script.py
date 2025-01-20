@@ -24,14 +24,19 @@ security_ids = [
     7982, 8840, 9428, 10515, 10576, 10939, 2328, 5851, 8506
 ]
 
+
 def calculate_current_value(stocks_current_prices):
-    total = 0.0
+    total_high = 0.0
+    total_low = 0.0
     for key, value in stocks_current_prices:
-        total += value["ohlc"]["high"]
-    return total
+        total_high += value["ohlc"]["high"]
+        total_high += value["ohlc"]["low"]
+    return total_high, total_low
+
 
 def fetch_stock_values_from_dhan():
-    current_price = 0.0
+    current_high_price = 0.0
+    current_low_price = 0.0
     try:
         dhan_object = dhanhq.dhanhq(CLIENT_ID, ACCESS_TOKEN)
         current_stock_data = dhan_object.quote_data({
@@ -39,31 +44,31 @@ def fetch_stock_values_from_dhan():
         })
 
         # parse the data from
-        current_price = calculate_current_value(current_stock_data["data"]["data"]["NSE_EQ"].items())
+        current_high_price, current_low_price = calculate_current_value(current_stock_data["data"]["data"]["NSE_EQ"].items())
     except Exception as e:
         print(e)
-    return  current_price
+    return current_high_price, current_low_price
+
 
 def update_value_in_db_and_user():
-    current_value = fetch_stock_values_from_dhan()
+    current_high_value, current_low_value = fetch_stock_values_from_dhan()
 
     doc = doc_ref.get()
-    highest_value = doc.to_dict().get("highest_value", 0.0) if doc.exists else 0.0
+    current_highest_value = doc.to_dict().get("highest_value", 0.0) if doc.exists else 0.0
 
-    print(current_value, highest_value)
+    print(current_high_value, current_high_value, current_highest_value)
 
-    if current_value > highest_value:
-        highest_value = current_value
-        doc_ref.set({"highest_value": highest_value})
-    elif (highest_value - current_value) / highest_value > 0.05:
+    if current_high_value > current_highest_value:
+        current_highest_value = current_high_value
+        doc_ref.set({"highest_value": current_highest_value})
+    elif (current_highest_value - current_low_value) / current_highest_value > 0.05:
         send_email(
             "Stock Alert: Significant Drop",
-            f"Current Value: {current_value}, Highest Value: {highest_value}",
+            f"Current Value: {current_low_value}, Highest Value: {current_highest_value}",
         )
-        highest_value = current_value
-        doc_ref.set({"highestValue": highest_value})
+        doc_ref.set({"highestValue": current_highest_value})
+
 
 # Run Script
 if __name__ == "__main__":
     update_value_in_db_and_user()
-
