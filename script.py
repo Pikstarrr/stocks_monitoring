@@ -75,8 +75,9 @@ def update_value_in_db_and_user():
             doc_ref.update({"difference_percent": 0.0})
         else:
             doc_ref.update({"difference_percent": difference_percent})
+        print(difference_percent)
 
-    print(current_high_value, current_low_value, current_highest_value, difference_percent)
+    print(current_high_value, current_low_value, current_highest_value)
 
 
 # Run Script
