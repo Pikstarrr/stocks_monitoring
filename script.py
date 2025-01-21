@@ -27,9 +27,11 @@ security_ids = [
 
 def calculate_current_value(stocks_current_prices):
     total_high = 0.0
+    total_low = 0.0
     for key, value in stocks_current_prices:
         total_high += value["ohlc"]["high"]
-    return total_high
+        total_low += value["ohlc"]["low"]
+    return total_high, total_low
 
 
 def fetch_stock_values_from_dhan():
@@ -42,38 +44,39 @@ def fetch_stock_values_from_dhan():
         })
 
         # parse the data from
-        current_high_price = calculate_current_value(current_stock_data["data"]["data"]["NSE_EQ"].items())
+        current_high_price, current_low_price = calculate_current_value(current_stock_data["data"]["data"]["NSE_EQ"].items())
     except Exception as e:
         print(e)
-    return current_high_price
+    return current_high_price, current_low_price
 
 
 def update_value_in_db_and_user():
-    current_high_value = fetch_stock_values_from_dhan()
+    current_high_value, current_low_value = fetch_stock_values_from_dhan()
 
-    if current_high_value == 0:
+    if current_high_value == 0 or current_low_value == 0:
         return
 
     doc = doc_ref.get()
     current_highest_value = doc.to_dict().get("highest_value", 0.0) if doc.exists else 0.0
 
-    difference_percent = ((current_highest_value - current_high_value) / current_highest_value) * 100
+    difference_percent = ((current_highest_value - current_low_value) / current_highest_value) * 100
     if current_high_value > current_highest_value:
         current_highest_value = current_high_value
         doc_ref.update({"highest_value": current_highest_value})
         doc_ref.update({"difference_percent": 0.0})
 
     elif difference_percent > 4:
+        current_highest_value = current_low_value
         send_email(
             "Stock Alert: Significant Drop",
-            f"Current Value: {current_high_value}, Highest Value: {current_highest_value}",
+            f"Current Value: {current_low_value}, Highest Value: {current_highest_value}",
         )
         doc_ref.update({"highest_value": current_highest_value})
-        doc_ref.update({"difference_percent": difference_percent})
+        doc_ref.update({"difference_percent": 0.0})
     else:
         doc_ref.update({"difference_percent": difference_percent})
 
-    print(current_high_value, current_highest_value, difference_percent)
+    print(current_high_value, current_low_value, current_highest_value, difference_percent)
 
 
 # Run Script
