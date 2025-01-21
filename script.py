@@ -59,22 +59,22 @@ def update_value_in_db_and_user():
     doc = doc_ref.get()
     current_highest_value = doc.to_dict().get("highest_value", 0.0) if doc.exists else 0.0
 
-    difference_percent = ((current_highest_value - current_low_value) / current_highest_value) * 100
     if current_high_value > current_highest_value:
         current_highest_value = current_high_value
         doc_ref.update({"highest_value": current_highest_value})
         doc_ref.update({"difference_percent": 0.0})
-
-    elif difference_percent > 4:
-        current_highest_value = current_low_value
-        send_email(
-            "Stock Alert: Significant Drop",
-            f"Current Value: {current_low_value}, Highest Value: {current_highest_value}",
-        )
-        doc_ref.update({"highest_value": current_highest_value})
-        doc_ref.update({"difference_percent": 0.0})
     else:
-        doc_ref.update({"difference_percent": difference_percent})
+        difference_percent = ((current_highest_value - current_low_value) / current_highest_value) * 100
+        if difference_percent > 4:
+            send_email(
+                "Stock Alert: Significant Drop",
+                f"Current Value: {current_low_value}, Highest Value: {current_highest_value}",
+            )
+            current_highest_value = current_low_value
+            doc_ref.update({"highest_value": current_highest_value})
+            doc_ref.update({"difference_percent": 0.0})
+        else:
+            doc_ref.update({"difference_percent": difference_percent})
 
     print(current_high_value, current_low_value, current_highest_value, difference_percent)
 
