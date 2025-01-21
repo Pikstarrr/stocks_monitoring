@@ -2,10 +2,13 @@ import smtplib
 from email.mime.text import MIMEText
 import os
 
+from dotenv import load_dotenv
+
 # EMAIL = os.environ["SENDER_EMAIL"]
 # PASSWORD = os.environ["MAIL_PASSWORD"]
 # RECIPIENT = os.environ["RECEIVER_MAIL"]
 
+load_dotenv()
 EMAIL = os.getenv("SENDER_EMAIL")
 PASSWORD = os.getenv("MAIL_PASSWORD")
 RECIPIENT = os.getenv("RECEIVER_MAIL")
