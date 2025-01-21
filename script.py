@@ -53,16 +53,19 @@ def fetch_stock_values_from_dhan():
 def update_value_in_db_and_user():
     current_high_value, current_low_value = fetch_stock_values_from_dhan()
 
+    if current_high_value == 0 or current_low_value == 0:
+        return
+
     doc = doc_ref.get()
     current_highest_value = doc.to_dict().get("highest_value", 0.0) if doc.exists else 0.0
 
-    difference_percent = (current_high_value - current_low_value) / current_high_value
+    difference_percent = ((current_highest_value - current_low_value) / current_highest_value) * 100
     if current_high_value > current_highest_value:
         current_highest_value = current_high_value
         doc_ref.update({"highest_value": current_highest_value})
         doc_ref.update({"difference_percent": 0.0})
 
-    elif difference_percent > 0.04:
+    elif difference_percent > 4:
         send_email(
             "Stock Alert: Significant Drop",
             f"Current Value: {current_low_value}, Highest Value: {current_highest_value}",
@@ -72,7 +75,7 @@ def update_value_in_db_and_user():
     else:
         doc_ref.update({"difference_percent": difference_percent})
 
-    print(current_high_value, current_high_value, current_highest_value, difference_percent)
+    print(current_high_value, current_low_value, current_highest_value, difference_percent)
 
 
 # Run Script
