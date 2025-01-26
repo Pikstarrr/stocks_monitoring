@@ -2,3 +2,5 @@ firebase-admin
 requests
 dhanhq
 python-dotenv
+pandas
+numpy
