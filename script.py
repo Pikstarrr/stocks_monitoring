@@ -25,12 +25,10 @@ security_ids = [10417, 10905, 11195, 11626, 11987, 13359, 13966, 14908, 15178, 1
 
 
 def calculate_current_value(stocks_current_prices):
-    total_high = 0.0
     total_current = 0.0
     for key, value in stocks_current_prices:
-        total_high += value["ohlc"]["high"]
         total_current += value["last_price"]
-    return total_high, total_current
+    return total_current
 
 
 def fetch_stock_values_from_dhan():
@@ -43,25 +41,25 @@ def fetch_stock_values_from_dhan():
         })
 
         # parse the data from
-        current_high_price, current_price = calculate_current_value(current_stock_data["data"]["data"]["NSE_EQ"].items())
+        current_price = calculate_current_value(current_stock_data["data"]["data"]["NSE_EQ"].items())
     except Exception as e:
         print(e)
-    return current_high_price, current_price
+    return current_price
 
 
 def update_value_in_db_and_user():
-    current_high_value, current_value = fetch_stock_values_from_dhan()
+    current_value = fetch_stock_values_from_dhan()
 
-    if current_high_value == 0 or current_value == 0:
+    if current_value == 0:
         return
 
     doc = doc_ref.get()
     current_highest_value = doc.to_dict().get("highest_value", 0.0) if doc.exists else 0.0
 
     print("Before :")
-    print(current_value, current_high_value, current_highest_value)
-    if current_high_value > current_highest_value:
-        current_highest_value = current_high_value
+    print(current_value, current_highest_value)
+    if current_value > current_highest_value:
+        current_highest_value = current_value
         doc_ref.update({"highest_value": current_highest_value})
         doc_ref.update({"difference_percent": 0.0})
     else:
@@ -79,7 +77,7 @@ def update_value_in_db_and_user():
         print(difference_percent)
 
     print("After : ")
-    print(current_value, current_high_value, current_highest_value)
+    print(current_value, current_highest_value)
 
 
 # Run Script
