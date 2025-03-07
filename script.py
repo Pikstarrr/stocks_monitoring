@@ -104,6 +104,7 @@ def update_value_in_db_and_user():
     if current_value > current_highest_value:
         current_highest_value = current_value
         doc_ref.update({"highest_value": current_highest_value})
+        doc_ref.update({"current_value": current_value})
         doc_ref.update({"difference_percent": 0.0})
     else:
         difference_percent = ((current_highest_value - current_value) / current_highest_value) * 100
@@ -114,9 +115,11 @@ def update_value_in_db_and_user():
             )
             current_highest_value = current_value
             doc_ref.update({"highest_value": current_highest_value})
+            doc_ref.update({"current_value": current_highest_value})
             doc_ref.update({"difference_percent": 0.0})
         else:
             doc_ref.update({"difference_percent": difference_percent})
+            doc_ref.update({"current_value": current_value})
         print(difference_percent)
 
     print("After : ")
