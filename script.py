@@ -17,11 +17,55 @@ load_dotenv()
 CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
 ACCESS_TOKEN = os.getenv("DHAN_API_KEY")
 
-security_ids = [10417, 10905, 11195, 11626, 11987, 13359, 13966, 14908, 15178, 15179,
- 18721, 193, 19401, 24909, 24961, 25358, 25907, 27213, 28378, 28903,
- 29135, 31181, 3672, 4656, 4847, 6125, 6445, 6705, 6944, 7374,
- 7506, 7508, 7982, 8840, 9087, 9428, 10515, 10576, 10939, 14428,
- 21750, 2328, 3010, 522, 5851, 8506]
+security_ids = {
+    'DYCL': 10417,
+    'MPSLTD': 10578,
+    'GENESYS': 10905,
+    'INDIGO': 11195,
+    'GOKEX': 11778,
+    'ICIL': 11987,
+    'KFINTECH': 13359,
+    'AARTIPHARM': 13868,
+    'HBLENGINE': 13966,
+    'KDDL': 14908,
+    'TARIL': 15178,
+    'ECLERX': 15179,
+    'HCG': 15555,
+    'SUVENPHAR': 17945,
+    'NUVAMA': 18721,
+    'BLUEJET': 19686,
+    'INTERARCH': 24909,
+    'ORIENTTECH': 24961,
+    'TDPOWERSYS': 25178,
+    'PGEL': 25358,
+    'WAAREEENER': 25907,
+    'EIEL': 27213,
+    'KITEX': 28903,
+    'INDUSTOWER': 29135,
+    'MCX': 31181,
+    'BORORENEW': 3155,
+    'SBCL': 4656,
+    'AMIORG': 5578,
+    'PAYTM': 6705,
+    'GANECOS': 6944,
+    'WOCKPHARMA': 7506,
+    'ZENTEC': 7508,
+    'GRWRHITECH': 7982,
+    'PIXTRANS': 9087,
+    'SKIPPER': 9428,
+    'AXISCADES': 9440,
+    'UTISENSETF': 10515,
+    'NIFTYBEES': 10576,
+    'JUNIORBEES': 10939,
+    'GOLDBEES': 14428,
+    'LIQUIDCASE': 21750,
+    'CPSEETF': 2328,
+    'BANKNIFTY1': 5851,
+    'MID150BEES': 8506,
+    'AXISTECETF': 3010,
+    'ICICIB22': 522,
+    'ONESOURCE': 29224
+}
 
 
 def calculate_current_value(stocks_current_prices):
@@ -32,12 +76,11 @@ def calculate_current_value(stocks_current_prices):
 
 
 def fetch_stock_values_from_dhan():
-    current_high_price = 0.0
     current_price = 0.0
     try:
         dhan_object = dhanhq.dhanhq(CLIENT_ID, ACCESS_TOKEN)
         current_stock_data = dhan_object.quote_data({
-            "NSE_EQ": security_ids,
+            "NSE_EQ": list(security_ids.values()),
         })
 
         # parse the data from
