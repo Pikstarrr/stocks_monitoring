@@ -61,8 +61,6 @@ security_ids = {
     'LIQUIDCASE': 21750,
     'CPSEETF': 2328,
     'BANKNIFTY1': 5851,
-    'MID150BEES': 8506,
-    'AXISTECETF': 3010,
     'ICICIB22': 522,
     'ONESOURCE': 29224
 }
