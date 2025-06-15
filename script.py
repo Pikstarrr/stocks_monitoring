@@ -128,7 +128,6 @@
 #     update_value_in_db_and_user()
 
 import numpy as np
-import requests
 import pandas as pd
 from datetime import datetime, timedelta
 from strategy_features import compute_feature, rational_quadratic_kernel, gaussian_kernel
@@ -136,17 +135,17 @@ from sklearn.metrics.pairwise import manhattan_distances
 
 import dhanhq
 
-from firebase_admin import credentials, firestore, initialize_app
+# from firebase_admin import credentials, firestore, initialize_app
 import os
 from dotenv import load_dotenv
 
 from send_mail import send_email
-
-# Firebase Setup
-cred = credentials.Certificate("stock-monitoring-fb.json")
-initialize_app(cred)
-db = firestore.client()
-doc_ref = db.collection("stock_data").document("values")
+#
+# # Firebase Setup
+# cred = credentials.Certificate("stock-monitoring-fb.json")
+# initialize_app(cred)
+# db = firestore.client()
+# doc_ref = db.collection("stock_data").document("values")
 
 load_dotenv()
 CLIENT_ID = os.getenv("DHAN_CLIENT_ID")

@@ -1,8 +1,9 @@
-firebase-admin~=6.6.0
-requests
 dhanhq~=2.0.2
 python-dotenv~=1.0.1
 pandas~=2.2.3
 numpy~=2.0.2
 ta~=0.11.0
 scikit-learn~=1.6.1
+
+#firebase-admin~=6.6.0
+#requests

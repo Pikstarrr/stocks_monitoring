@@ -1,5 +1,4 @@
 import numpy as np
-import requests
 import pandas as pd
 from datetime import datetime, timedelta
 from strategy_features import compute_feature, rational_quadratic_kernel, gaussian_kernel
