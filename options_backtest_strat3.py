@@ -119,33 +119,14 @@ def simulate_streaming_base_df(base_csv, stream_csv):
 
         yield base_df.copy()  # Yield a copy to avoid mutation outside
 
-def fast_simulate_streaming_base_df(base_csv, stream_csv):
-    base_df = pd.read_csv(base_csv, parse_dates=['datetime'])
-    stream_df = pd.read_csv(stream_csv, parse_dates=['datetime'])
-
-    # Convert both to sorted list of rows (to avoid expensive .iloc later)
-    base_records = base_df.sort_values('datetime').to_dict('records')
-    stream_records = stream_df.sort_values('datetime').to_dict('records')
-
-    # Create deque for rolling window (initial base window)
-    window = deque(base_records, maxlen=len(base_records))
-
-    for new_row in stream_records:
-        window.append(new_row)  # Automatically removes oldest row
-        df_out = pd.DataFrame(window)
-        df_out['datetime'] = pd.to_datetime(df_out['datetime'])
-        df_out.set_index('datetime', inplace=True)
-        yield df_out.copy()
-
-
 def fetch_ohlc(symbol, interval=15, months=5):
     end = datetime.now()
     start = end - timedelta(days=30 * months)
 
     chunks = []
     current_start = start
-    while current_start < end:
-        current_end = min(current_start + timedelta(days=74), end)
+    while current_start <= end:
+        current_end = min(current_start + timedelta(days=75), end)
         r = dhan_object.intraday_minute_data(
             security_id=symbol,
             from_date=current_start.strftime('%Y-%m-%d'),
@@ -235,58 +216,6 @@ def backtest(df, predictions):
             log_entries.append(log_row)
 
     return trades, pd.DataFrame(log_entries)
-
-# === Process All Files Year by Year ===
-# os.makedirs(OUTPUT_DIR, exist_ok=True)
-# summary_stats = []
-
-# for yearly_df in fast_simulate_streaming_base_df("DataSets/history_data.csv", "DataSets/live_data.csv"):
-#     if len(yearly_df) < 100:
-#         print(f"Skipping: too little data")
-#         continue
-#
-#     print(f"Running with {len(yearly_df)} rows...")
-#
-#     features = build_features(yearly_df)
-#     if len(features) < LOOKAHEAD:
-#         print(f"Not enough features to run ML on")
-#         continue
-#
-#     predictions = predict_labels(features, yearly_df['close'])
-#     trades, logs = backtest(yearly_df.loc[predictions.index], predictions)
-#
-#     pnl = 0
-#     positions = []
-#     for i in range(1, len(trades), 2):
-#         t1, action1, price1 = trades[i - 1]
-#         t2, action2, price2 = trades[i]
-#         profit = price2 - price1 if action1 == 'BUY' else price1 - price2
-#         pnl += profit
-#         positions.append((t1, action1, price1, t2, action2, price2, profit))
-#
-#     results = pd.DataFrame(positions,
-#                            columns=["EntryTime", "EntryType", "EntryPrice", "ExitTime", "ExitType", "ExitPrice", "PnL"])
-#     win_rate = (results['PnL'] > 0).sum() / len(results) * 100 if len(results) > 0 else 0
-#
-#     summary_stats.append({
-#         "Total Trades": len(results),
-#         "Total PnL": round(pnl, 2),
-#         "Win Rate (%)": round(win_rate, 2)
-#     })
-#
-#     logs.to_csv(os.path.join(OUTPUT_DIR, f"debug_log.csv"), index=False)
-#     results.to_csv(os.path.join(OUTPUT_DIR, f"backtest_results.csv"), index=False)
-#
-# # === Print Summary Table ===
-# summary_df = pd.DataFrame(summary_stats).sort_values(by=["Interval", "Year"])
-# print("===== STRATEGY PERFORMANCE SUMMARY =====")
-# print(summary_df.to_string(index=False))
-#
-# # === Identify Best Performing Interval ===
-# best_row = summary_df.sort_values(by="Total PnL", ascending=False).iloc[0]
-# print("📈 Best Performing Interval:")
-# print(f"Interval: {best_row['Interval']} | Year: {int(best_row['Year'])} | Total PnL: {best_row['Total PnL']} | Win Rate: {best_row['Win Rate (%)']}%")
-
 
 def your_strategy_function(symbol):
     yearly_df = fetch_ohlc(symbol)
