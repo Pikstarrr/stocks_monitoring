@@ -334,8 +334,10 @@ def your_strategy_function(symbol):
             "alerts": ArrayUnion([log_str])
         })
 
-    print(trades)
-    print(logs)
+    last_trade = trades[-1]
+    print(f"📈 Last Trade: {last_trade}")
+    last_log = logs.iloc[-1]
+    print(f"📝 Logs: {last_log}")
 
 def is_market_closed():
     # IST is UTC+5:30
@@ -353,7 +355,7 @@ def run_every_15_minutes_until_close():
         your_strategy_function("25")
         # Sleep until the next 15-minute mark
         now = datetime.now()
-        next_run = (now + timedelta(minutes=2)).replace(second=0, microsecond=0)
+        next_run = (now + timedelta(minutes=15)).replace(second=0, microsecond=0)
         sleep_duration = (next_run - now).total_seconds()
         print(f"🕒 Sleeping for {int(sleep_duration)} seconds...\n")
         time.sleep(sleep_duration)
