@@ -1,4 +1,5 @@
 # momentum_x_backtest.py — improved version with label thresholding, confidence filter, kernel tuning, and ATR exit logic
+import csv
 import math
 import time
 from collections import deque
@@ -35,6 +36,7 @@ LOOKAHEAD = 4
 LABEL_THRESHOLD = 0.002  # 0.2% move threshold
 CONFIDENCE_THRESHOLD = 3
 
+
 # === Feature Calculation ===
 def build_features(df):
     features = []
@@ -43,6 +45,7 @@ def build_features(df):
         f.name = f"{kind}_{param_a}_{param_b}"
         features.append(f)
     return pd.concat(features, axis=1).dropna()
+
 
 # === Fast Label Prediction with Threshold and Confidence ===
 def predict_labels(features, close_series):
@@ -78,6 +81,7 @@ def predict_labels(features, close_series):
 
     return pd.Series(predictions, index=features.index)
 
+
 # === Kernel Signal Detection (tuned params) ===
 def get_kernel_signals(series, h=10, r=6.0, x=15, lag=1):
     yhat1 = rational_quadratic_kernel(series, h, r, x)
@@ -85,6 +89,7 @@ def get_kernel_signals(series, h=10, r=6.0, x=15, lag=1):
     bullish = (yhat1.shift(1) < yhat1)
     bearish = (yhat1.shift(1) > yhat1)
     return bullish, bearish, yhat1, yhat2
+
 
 # === ATR Calculation ===
 def calculate_atr(df, period=14):
@@ -98,6 +103,7 @@ def calculate_atr(df, period=14):
     ], axis=1).max(axis=1)
     atr = tr.rolling(window=period).mean()
     return atr
+
 
 def simulate_streaming_base_df(base_csv, stream_csv):
     base_df = pd.read_csv(base_csv, parse_dates=['datetime'])
@@ -118,6 +124,7 @@ def simulate_streaming_base_df(base_csv, stream_csv):
         base_df = base_df.sort_index()
 
         yield base_df.copy()  # Yield a copy to avoid mutation outside
+
 
 def fetch_ohlc(symbol, interval=15, months=5):
     end = datetime.now()
@@ -157,6 +164,7 @@ def fetch_ohlc(symbol, interval=15, months=5):
         df.loc[now] = [ltp, ltp, ltp, ltp]
 
     return df.sort_index()
+
 
 # === Backtest Logic ===
 def backtest(df, predictions):
@@ -217,6 +225,7 @@ def backtest(df, predictions):
 
     return trades, pd.DataFrame(log_entries)
 
+
 def your_strategy_function(symbol):
     yearly_df = fetch_ohlc(symbol)
 
@@ -234,8 +243,8 @@ def your_strategy_function(symbol):
     predictions = predict_labels(features, yearly_df['close'])
     trades, logs = backtest(yearly_df.loc[predictions.index], predictions)
 
-    if math.isnan(logs['Action'][logs.index[-1]]):
-       print("No prediction")
+    if pd.isnull(logs['Action'][logs.index[-1]]):
+        print("No prediction")
     else:
         last_row = logs.iloc[-1]
         index = 'NIFTY' if '13' in symbol else 'BANKNIFTY'
@@ -268,11 +277,32 @@ def your_strategy_function(symbol):
     last_log = logs.iloc[-1]
     print(f"📝 Logs: {last_log}")
 
+    # pnl = 0
+    # positions = []
+    # for i in range(1, len(trades), 2):
+    #     t1, action1, price1 = trades[i - 1]
+    #     t2, action2, price2 = trades[i]
+    #     profit = price2 - price1 if action1 == 'BUY' else price1 - price2
+    #     pnl += profit
+    #     positions.append((t1, action1, price1, t2, action2, price2, profit))
+    #
+    # results = pd.DataFrame(positions,
+    #                        columns=["EntryTime", "EntryType", "EntryPrice", "ExitTime", "ExitType", "ExitPrice", "PnL"])
+    # win_rate = (results['PnL'] > 0).sum() / len(results) * 100 if len(results) > 0 else 0
+    #
+    # print({
+    #     "Total Trades": len(results),
+    #     "Total PnL": round(pnl, 2),
+    #     "Win Rate (%)": round(win_rate, 2)
+    # })
+
+
 def is_market_closed():
     # IST is UTC+5:30
     now = datetime.now()
     market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
     return now >= market_close
+
 
 def run_every_15_minutes_until_close():
     print("✅ Strategy started. Will run every 15 minutes until 3:30 PM IST.")
@@ -303,7 +333,6 @@ if __name__ == '__main__':
     cred = credentials.Certificate("stock-monitoring-fb.json")
     initialize_app(cred)
     db = firestore.client()
+    summary_stats = []
 
     run_every_15_minutes_until_close()
-
-
