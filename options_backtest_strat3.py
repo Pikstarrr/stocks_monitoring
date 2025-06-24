@@ -226,8 +226,9 @@ def backtest(df, predictions):
     return trades, pd.DataFrame(log_entries)
 
 
-def your_strategy_function(symbol):
-    yearly_df = fetch_ohlc(symbol)
+def your_strategy_function(index_dict):
+    symbol, index = next(iter(index_dict.items()))
+    yearly_df = fetch_ohlc(symbol, interval=25)
 
     if len(yearly_df) < 100:
         print(f"Skipping: too little data")
@@ -247,7 +248,6 @@ def your_strategy_function(symbol):
         print("No prediction")
     else:
         last_row = logs.iloc[-1]
-        index = 'NIFTY' if '13' in symbol else 'BANKNIFTY'
         log_str = (
             f"INDEX: {index}, "
             f"Time: {last_row['Time']}, "
@@ -277,24 +277,26 @@ def your_strategy_function(symbol):
     last_log = logs.iloc[-1]
     print(f"📝 Logs: {last_log}")
 
-    # pnl = 0
-    # positions = []
-    # for i in range(1, len(trades), 2):
-    #     t1, action1, price1 = trades[i - 1]
-    #     t2, action2, price2 = trades[i]
-    #     profit = price2 - price1 if action1 == 'BUY' else price1 - price2
-    #     pnl += profit
-    #     positions.append((t1, action1, price1, t2, action2, price2, profit))
-    #
-    # results = pd.DataFrame(positions,
-    #                        columns=["EntryTime", "EntryType", "EntryPrice", "ExitTime", "ExitType", "ExitPrice", "PnL"])
-    # win_rate = (results['PnL'] > 0).sum() / len(results) * 100 if len(results) > 0 else 0
-    #
-    # print({
-    #     "Total Trades": len(results),
-    #     "Total PnL": round(pnl, 2),
-    #     "Win Rate (%)": round(win_rate, 2)
-    # })
+    pnl = 0
+    positions = []
+    for i in range(1, len(trades), 2):
+        t1, action1, price1 = trades[i - 1]
+        t2, action2, price2 = trades[i]
+        profit = price2 - price1 if action1 == 'BUY' else price1 - price2
+        pnl += profit
+        positions.append((t1, action1, price1, t2, action2, price2, profit))
+
+    results = pd.DataFrame(positions,
+                           columns=["EntryTime", "EntryType", "EntryPrice", "ExitTime", "ExitType", "ExitPrice", "PnL"])
+    win_rate = (results['PnL'] > 0).sum() / len(results) * 100 if len(results) > 0 else 0
+
+    print({
+        "Total Trades": len(results),
+        "Total PnL": round(pnl, 2),
+        "Win Rate (%)": round(win_rate, 2)
+    })
+
+    print("------------- INTERATION COMPLETE --------------")
 
 
 def is_market_closed():
@@ -310,11 +312,14 @@ def run_every_15_minutes_until_close():
         # if is_market_closed():
         #     print("⏹️ Market closed at 3:30 PM. Stopping strategy.")
         #     break
-        your_strategy_function("13")
-        your_strategy_function("25")
+        your_strategy_function({"13": "NIFTY"})
+        your_strategy_function({"25": "BANKNIFTY"})
+        your_strategy_function({"51": "SENSEX"})
+        your_strategy_function({"27": "FINNIFTY"})
+        your_strategy_function({"442": "MIDCPNIFTY"})
         # Sleep until the next 15-minute mark
         now = datetime.now()
-        next_run = (now + timedelta(minutes=15)).replace(second=0, microsecond=0)
+        next_run = (now + timedelta(minutes=25)).replace(second=0, microsecond=0)
         sleep_duration = (next_run - now).total_seconds()
         print(f"🕒 Sleeping for {int(sleep_duration)} seconds...\n")
         time.sleep(sleep_duration)

@@ -19,6 +19,10 @@ def send_email(subject, body):
     msg["From"] = EMAIL
     msg["To"] = RECIPIENT
 
+    msg["X-Priority"] = "1"
+    msg["Importance"] = "High"
+    msg["X-MSMail-Priority"] = "High"
+
     with smtplib.SMTP("smtp.gmail.com", 587) as server:
         server.starttls()
         server.login(EMAIL, PASSWORD)
