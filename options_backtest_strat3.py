@@ -19,6 +19,8 @@ from strategy_features import compute_feature, rational_quadratic_kernel, gaussi
 
 import dhanhq
 
+from trade_placement import KotakOptionsTrader
+
 # === CONFIG ===
 FEATURE_CONFIG = [
     ("RSI", 14, 1),
@@ -272,29 +274,33 @@ def your_strategy_function(index_dict):
             "alerts": ArrayUnion([log_str])
         })
 
+        # action = last_row['Action']
+        # action = action.split()[0].strip()
+        # trader.execute_single_trade(last_row['Time'], action, last_row['Close'], index)
+
     last_trade = trades[-1]
     print(f"📈 Last Trade: {last_trade}")
     last_log = logs.iloc[-1]
     print(f"📝 Logs: {last_log}")
 
-    pnl = 0
-    positions = []
-    for i in range(1, len(trades), 2):
-        t1, action1, price1 = trades[i - 1]
-        t2, action2, price2 = trades[i]
-        profit = price2 - price1 if action1 == 'BUY' else price1 - price2
-        pnl += profit
-        positions.append((t1, action1, price1, t2, action2, price2, profit))
-
-    results = pd.DataFrame(positions,
-                           columns=["EntryTime", "EntryType", "EntryPrice", "ExitTime", "ExitType", "ExitPrice", "PnL"])
-    win_rate = (results['PnL'] > 0).sum() / len(results) * 100 if len(results) > 0 else 0
-
-    print({
-        "Total Trades": len(results),
-        "Total PnL": round(pnl, 2),
-        "Win Rate (%)": round(win_rate, 2)
-    })
+    # pnl = 0
+    # positions = []
+    # for i in range(1, len(trades), 2):
+    #     t1, action1, price1 = trades[i - 1]
+    #     t2, action2, price2 = trades[i]
+    #     profit = price2 - price1 if action1 == 'BUY' else price1 - price2
+    #     pnl += profit
+    #     positions.append((t1, action1, price1, t2, action2, price2, profit))
+    #
+    # results = pd.DataFrame(positions,
+    #                        columns=["EntryTime", "EntryType", "EntryPrice", "ExitTime", "ExitType", "ExitPrice", "PnL"])
+    # win_rate = (results['PnL'] > 0).sum() / len(results) * 100 if len(results) > 0 else 0
+    #
+    # print({
+    #     "Total Trades": len(results),
+    #     "Total PnL": round(pnl, 2),
+    #     "Win Rate (%)": round(win_rate, 2)
+    # })
 
     print("------------- INTERATION COMPLETE --------------")
 
@@ -329,6 +335,17 @@ if __name__ == '__main__':
     load_dotenv()
     CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
     ACCESS_TOKEN = os.getenv("DHAN_API_KEY")
+    KOTAK_CONSUMER_KEY = os.getenv("KOTAK_CONSUMER_KEY")
+    KOTAK_CONSUMER_SECRET = os.getenv("KOTAK_CONSUMER_SECRET")
+    KOTAK_MOBILE_NUMBER = os.getenv("KOTAK_MOBILE_NUMBER")
+    KOTAK_PASSWORD = os.getenv("KOTAK_PASSWORD")
+    KOTAK_ACCESS_TOKEN = os.getenv("KOTAK_ACCESS_TOKEN")
+
+    trader = KotakOptionsTrader(
+        consumer_key=KOTAK_CONSUMER_KEY,
+        consumer_secret=KOTAK_CONSUMER_KEY,
+        access_token=KOTAK_ACCESS_TOKEN,
+    )
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
