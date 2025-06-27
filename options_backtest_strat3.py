@@ -246,61 +246,63 @@ def your_strategy_function(index_dict):
     predictions = predict_labels(features, yearly_df['close'])
     trades, logs = backtest(yearly_df.loc[predictions.index], predictions)
 
-    if pd.isnull(logs['Action'][logs.index[-1]]):
-        print("No prediction")
-    else:
-        last_row = logs.iloc[-1]
-        log_str = (
-            f"INDEX: {index}, "
-            f"Time: {last_row['Time']}, "
-            f"Signal: {last_row['Signal']}, "
-            f"Close: {last_row['Close']:.2f}, "
-            f"ATR: {last_row['ATR']:.2f}, "
-            f"RK: {last_row['RK']:.2f}, "
-            f"GK: {last_row['GK']:.2f}, "
-            f"Bullish: {last_row['Bullish']}, "
-            f"Bearish: {last_row['Bearish']}, "
-            f"Position: {last_row['Position']}, "
-            f"Action: {last_row['Action']}"
-        )
+    print("------------- INTERATION STARTED --------------")
 
-        subject = f"{index} SIGNAL: {last_row['Action']}"
-        body = log_str
-        print(f"📧 Alert: {body}")
-        send_email(subject, body)
-
-        doc_ref = db.collection("live_alerts").document(index)
-        doc_ref.update({
-            "alerts": ArrayUnion([log_str])
-        })
-
-        # action = last_row['Action']
-        # action = action.split()[0].strip()
-        # trader.execute_single_trade(last_row['Time'], action, last_row['Close'], index)
+    # if pd.isnull(logs['Action'][logs.index[-1]]):
+    #     print("No prediction")
+    # else:
+    #     last_row = logs.iloc[-1]
+    #     log_str = (
+    #         f"INDEX: {index}, "
+    #         f"Time: {last_row['Time']}, "
+    #         f"Signal: {last_row['Signal']}, "
+    #         f"Close: {last_row['Close']:.2f}, "
+    #         f"ATR: {last_row['ATR']:.2f}, "
+    #         f"RK: {last_row['RK']:.2f}, "
+    #         f"GK: {last_row['GK']:.2f}, "
+    #         f"Bullish: {last_row['Bullish']}, "
+    #         f"Bearish: {last_row['Bearish']}, "
+    #         f"Position: {last_row['Position']}, "
+    #         f"Action: {last_row['Action']}"
+    #     )
+    #
+    #     subject = f"{index} SIGNAL: {last_row['Action']}"
+    #     body = log_str
+    #     print(f"📧 Alert: {body}")
+    #     send_email(subject, body)
+    #
+    #     doc_ref = db.collection("live_alerts").document(index)
+    #     doc_ref.update({
+    #         "alerts": ArrayUnion([log_str])
+    #     })
+    #
+    #     action = last_row['Action']
+    #     action = action.split()[0].strip()
+    #     trader.execute_single_trade(timestamp=last_row['Time'], index_name=index, signal_type=action)
 
     last_trade = trades[-1]
     print(f"📈 Last Trade: {last_trade}")
     last_log = logs.iloc[-1]
     print(f"📝 Logs: {last_log}")
 
-    # pnl = 0
-    # positions = []
-    # for i in range(1, len(trades), 2):
-    #     t1, action1, price1 = trades[i - 1]
-    #     t2, action2, price2 = trades[i]
-    #     profit = price2 - price1 if action1 == 'BUY' else price1 - price2
-    #     pnl += profit
-    #     positions.append((t1, action1, price1, t2, action2, price2, profit))
-    #
-    # results = pd.DataFrame(positions,
-    #                        columns=["EntryTime", "EntryType", "EntryPrice", "ExitTime", "ExitType", "ExitPrice", "PnL"])
-    # win_rate = (results['PnL'] > 0).sum() / len(results) * 100 if len(results) > 0 else 0
-    #
-    # print({
-    #     "Total Trades": len(results),
-    #     "Total PnL": round(pnl, 2),
-    #     "Win Rate (%)": round(win_rate, 2)
-    # })
+    pnl = 0
+    positions = []
+    for i in range(1, len(trades), 2):
+        t1, action1, price1 = trades[i - 1]
+        t2, action2, price2 = trades[i]
+        profit = price2 - price1 if action1 == 'BUY' else price1 - price2
+        pnl += profit
+        positions.append((t1, action1, price1, t2, action2, price2, profit))
+
+    results = pd.DataFrame(positions,
+                           columns=["EntryTime", "EntryType", "EntryPrice", "ExitTime", "ExitType", "ExitPrice", "PnL"])
+    win_rate = (results['PnL'] > 0).sum() / len(results) * 100 if len(results) > 0 else 0
+
+    print({
+        "Total Trades": len(results),
+        "Total PnL": round(pnl, 2),
+        "Win Rate (%)": round(win_rate, 2)
+    })
 
     print("------------- INTERATION COMPLETE --------------")
 
@@ -342,8 +344,6 @@ if __name__ == '__main__':
     KOTAK_ACCESS_TOKEN = os.getenv("KOTAK_ACCESS_TOKEN")
 
     trader = KotakOptionsTrader(
-        consumer_key=KOTAK_CONSUMER_KEY,
-        consumer_secret=KOTAK_CONSUMER_KEY,
         access_token=KOTAK_ACCESS_TOKEN,
     )
 

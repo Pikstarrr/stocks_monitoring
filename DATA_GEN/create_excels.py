@@ -6,8 +6,8 @@ INPUT_FILE = "my_data_bank.csv"  # <-- change to your actual filename
 
 intervals = {
     '15min': '15min',
-    '30min': '30min',
-    '1h': '1h'
+    # '30min': '30min',
+    # '1h': '1h'
 }
 
 # === Load and Parse Data ===
