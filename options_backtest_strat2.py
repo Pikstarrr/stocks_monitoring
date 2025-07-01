@@ -2,7 +2,6 @@
 import time
 import json
 import os
-import pickle
 from datetime import datetime, timedelta
 from firebase_admin import credentials, firestore, initialize_app
 
@@ -616,7 +615,7 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None):
         doc_ref.update({"alerts": ArrayUnion([log_str])})
 
         # Execute trade
-        # trader.execute_single_trade(timestamp=current_time, index_name=index, signal_type=action_taken)
+        trader.execute_single_trade(timestamp=current_time, index_name=index, signal_type=action_taken)
     else:
         print(f"📊 {index}: {log_str}")
 
@@ -948,17 +947,12 @@ if __name__ == '__main__':
         elif sys.argv[1] == 'validate':
             print("Running validation mode...")
             compare_results()
-        elif sys.argv[1] == 'test':
-            # Test Kotak setup only
-            print("Testing Kotak Options Trader...")
-            trader = KotakOptionsTrader(access_token=KOTAK_ACCESS_TOKEN, test_mode=True)
-            trader.test_strategy_setup()
         elif sys.argv[1] == 'test_live':
             # Run live mode with test orders
             print("Running in TEST LIVE mode (no real trades)...")
 
             # Initialize Kotak trader in test mode
-            trader = KotakOptionsTrader(access_token=KOTAK_ACCESS_TOKEN, test_mode=True)
+            trader = KotakOptionsTrader(test_mode=True)
 
             print("\n*** KOTAK TRADER IN TEST MODE - NO REAL ORDERS ***\n")
 
@@ -981,7 +975,7 @@ if __name__ == '__main__':
         print("Running in LIVE TRADING mode...")
 
         # Initialize Kotak trader in LIVE mode
-        trader = KotakOptionsTrader(access_token=KOTAK_ACCESS_TOKEN, test_mode=False)
+        trader = KotakOptionsTrader(test_mode=False)
 
         # Check if trader is logged in
         status = trader.get_account_status()
