@@ -155,7 +155,7 @@ def fetch_ohlc(symbol, interval=15, months=5):
     df = df[['open', 'high', 'low', 'close']].astype(float)
 
     # Append live candle if needed
-    now = pd.Timestamp.now().floor("15min")
+    now = pd.Timestamp.now().floor("25min")
     if now not in df.index or (datetime.now() - df.index[-1].to_pydatetime()).total_seconds() > 1200:
         print(f"🔄 Appending live LTP for {symbol}")
         r2 = dhan_object.quote_data({
@@ -285,24 +285,24 @@ def your_strategy_function(index_dict):
     last_log = logs.iloc[-1]
     print(f"📝 Logs: {last_log}")
 
-    pnl = 0
-    positions = []
-    for i in range(1, len(trades), 2):
-        t1, action1, price1 = trades[i - 1]
-        t2, action2, price2 = trades[i]
-        profit = price2 - price1 if action1 == 'BUY' else price1 - price2
-        pnl += profit
-        positions.append((t1, action1, price1, t2, action2, price2, profit))
-
-    results = pd.DataFrame(positions,
-                           columns=["EntryTime", "EntryType", "EntryPrice", "ExitTime", "ExitType", "ExitPrice", "PnL"])
-    win_rate = (results['PnL'] > 0).sum() / len(results) * 100 if len(results) > 0 else 0
-
-    print({
-        "Total Trades": len(results),
-        "Total PnL": round(pnl, 2),
-        "Win Rate (%)": round(win_rate, 2)
-    })
+    # pnl = 0
+    # positions = []
+    # for i in range(1, len(trades), 2):
+    #     t1, action1, price1 = trades[i - 1]
+    #     t2, action2, price2 = trades[i]
+    #     profit = price2 - price1 if action1 == 'BUY' else price1 - price2
+    #     pnl += profit
+    #     positions.append((t1, action1, price1, t2, action2, price2, profit))
+    #
+    # results = pd.DataFrame(positions,
+    #                        columns=["EntryTime", "EntryType", "EntryPrice", "ExitTime", "ExitType", "ExitPrice", "PnL"])
+    # win_rate = (results['PnL'] > 0).sum() / len(results) * 100 if len(results) > 0 else 0
+    #
+    # print({
+    #     "Total Trades": len(results),
+    #     "Total PnL": round(pnl, 2),
+    #     "Win Rate (%)": round(win_rate, 2)
+    # })
 
     print("------------- INTERATION COMPLETE --------------")
 
