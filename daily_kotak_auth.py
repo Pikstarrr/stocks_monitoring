@@ -114,13 +114,14 @@ def daily_authentication():
 
         # Get session tokens from client configuration
         config = client.api_client.configuration
+
         session_tokens = {
-            'edit_token': getattr(config, 'edit_token', None),
-            'sid': getattr(config, 'sid', None),
-            'edit_sid': getattr(config, 'edit_sid', None),
-            'edit_rid': getattr(config, 'edit_rid', None),
-            'serverId': getattr(config, 'serverId', None),
-            'userId': getattr(config, 'userId', None)
+            'edit_token': client.configuration.edit_token,
+            'sid': client.configuration.sid,
+            'edit_sid': client.configuration.edit_sid,
+            'edit_rid': client.configuration.edit_rid,
+            'serverId': client.configuration.serverId,
+            'userId': client.configuration.userId,
         }
 
         session_data = {

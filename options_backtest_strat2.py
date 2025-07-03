@@ -898,7 +898,8 @@ def run_live_trading(signal_state, trader):
         try:
             quote_response = dhan_object.quote_data({"IDX_I": all_symbols})
             quotes = {}
-            if 'data' in quote_response and 'data' in quote_response['data'] and 'IDX_I' in quote_response['data']['data']:
+            if 'data' in quote_response and 'data' in quote_response['data'] and 'IDX_I' in quote_response['data'][
+                'data']:
                 quotes = quote_response['data']['data']['IDX_I']
         except Exception as e:
             print(f"Error fetching quotes: {e}")
@@ -914,13 +915,37 @@ def run_live_trading(signal_state, trader):
                 continue
 
         # Sleep for 25 minutes
-        now = datetime.now()
-        next_run = now + timedelta(minutes=interval_time)
-        next_run = next_run.replace(second=0, microsecond=0)
+        next_run = get_next_candle_time()
+        sleep_duration = (next_run - datetime.now()).total_seconds()
 
-        sleep_duration = (next_run - now).total_seconds()
-        print(f"\n🕒 Next run at {next_run.strftime('%H:%M:%S')}. Sleeping for {int(sleep_duration)} seconds...\n")
-        time.sleep(sleep_duration)
+        if sleep_duration > 0:
+            print(
+                f"\n🕒 Next run at {next_run.strftime('%H:%M:%S')} (candle close + 30s). Sleeping for {int(sleep_duration)} seconds...\n")
+            time.sleep(sleep_duration)
+
+
+def get_next_candle_time():
+    """Calculate the next 25-minute candle close time"""
+    now = datetime.now()
+
+    # Market opens at 9:15
+    market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
+
+    # If before market open, return first candle close
+    if now < market_open:
+        return market_open + timedelta(minutes=25)
+
+    # Calculate minutes since market open
+    minutes_since_open = (now - market_open).total_seconds() / 60
+
+    # Calculate which candle we're in
+    candles_passed = int(minutes_since_open // 25)
+
+    # Next candle close time
+    next_candle_close = market_open + timedelta(minutes=(candles_passed + 1) * 25)
+
+    # Add 30 seconds buffer to ensure candle is fully closed
+    return next_candle_close + timedelta(seconds=30)
 
 
 # === Main Entry Point ===
@@ -995,4 +1020,3 @@ if __name__ == '__main__':
 
         # Run strategy
         run_live_trading(signal_state, trader)
-
