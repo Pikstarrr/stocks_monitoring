@@ -32,7 +32,8 @@ def test_all_indices(test_mode=True):
     print("✅ Trader initialized successfully!")
 
     # List of indices to test
-    indices = ["NIFTY", "BANKNIFTY", "SENSEX", "FINNIFTY", "MIDCPNIFTY"]
+    # indices = ["NIFTY", "BANKNIFTY", "SENSEX", "FINNIFTY", "MIDCPNIFTY"]
+    indices = ["SENSEX"]
     hold_time = 60  # 1 minute
 
     # Store results

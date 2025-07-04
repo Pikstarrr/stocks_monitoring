@@ -39,13 +39,22 @@ import logging
 import dhanhq
 
 # Configure logging
+import sys
+
+# Create handlers with UTF-8 encoding
+file_handler = logging.FileHandler('trading.log', encoding='utf-8')
+console_handler = logging.StreamHandler(sys.stdout)
+
+# Set UTF-8 encoding for console on Windows
+if sys.platform == 'win32':
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('trading.log'),
-        logging.StreamHandler()
-    ]
+    handlers=[file_handler, console_handler]
 )
 logger = logging.getLogger(__name__)
 
@@ -435,10 +444,23 @@ class KotakOptionsTrader:
                     response = requests.get(bse_fo_url, timeout=30)
                     response.raise_for_status()
 
-                    # Parse BSE CSV content
+                    # Parse BSE CSV content with dtype specification to avoid warnings
                     from io import StringIO
                     csv_content = StringIO(response.text)
-                    bse_df = pd.read_csv(csv_content)
+
+                    # Read with specified dtypes to avoid mixed type warnings
+                    bse_df = pd.read_csv(csv_content, dtype={
+                        'pSymbol': str,
+                        'pTrdSymbol': str,
+                        'pGroup': str,
+                        'pExchSeg': str,
+                        'pInstType': str,
+                        'pSymbolName': str,
+                        'pOptionType': str,
+                        'pScripRefKey': str,
+                        'pISIN': str,
+                        'pAssetCode': str
+                    })
 
                     # Apply same transformations as NSE data
                     column_rename = {
@@ -454,10 +476,27 @@ class KotakOptionsTrader:
                     bse_df['pExpiry_str'] = bse_df['pExpiry_dt'].dt.strftime('%d%b%Y').str.upper()
                     bse_df['pLotSize'] = pd.to_numeric(bse_df['pLotSize'], errors='coerce')
 
-                    # Filter BSE options
+                    # Filter BSE options - check for SENSEX specifically
                     if 'pInstType' in bse_df.columns:
-                        bse_options = bse_df[bse_df['pInstType'].str.upper().isin(['OPTIDX', 'OPTSTK'])]
-                        logger.info(f"Found {len(bse_options)} BSE option instruments")
+                        # First check what instrument types we have
+                        logger.info(f"BSE Instrument types: {bse_df['pInstType'].unique()}")
+
+                        # Filter for options (OPTIDX for index options)
+                        bse_options = bse_df[
+                            (bse_df['pInstType'].str.upper().isin(['OPTIDX', 'OPTSTK'])) |
+                            (bse_df['pTrdSymbol'].str.contains('SENSEX', na=False))
+                            ]
+
+                        # Log SENSEX specific info
+                        sensex_options = bse_options[bse_options['pTrdSymbol'].str.contains('SENSEX', na=False)]
+                        logger.info(f"Found {len(sensex_options)} SENSEX option instruments")
+
+                        if len(sensex_options) > 0:
+                            sample = sensex_options.iloc[0]
+                            logger.info(
+                                f"Sample SENSEX option: {sample['pTrdSymbol']} - Strike: {sample['pStrikePrice']}")
+
+                        logger.info(f"Total BSE option instruments: {len(bse_options)}")
 
                         # Merge with NSE data
                         self.scrip_master_df = pd.concat([self.scrip_master_df, bse_options], ignore_index=True)
@@ -465,6 +504,7 @@ class KotakOptionsTrader:
 
                 except Exception as e:
                     logger.warning(f"Failed to load BSE scrip master: {e}")
+                    logger.error("Stack trace: ", exc_info=True)
 
             # ✅ Create index name mapping from trading symbols
             self._create_index_mapping()
@@ -955,25 +995,31 @@ class KotakOptionsTrader:
 
         logger.info(f"Looking for trading symbol pattern: {search_pattern}")
 
+        # Determine exchange based on index
+        if index_name == 'SENSEX':
+            exchange_segments = ['bse_fo', 'BSE_FO', 'BSE_F&O_CM']
+        else:
+            exchange_segments = ['nse_fo', 'NSE_FO']
+
         # Search by exact trading symbol
         matching_instruments = self.scrip_master_df[
             (self.scrip_master_df['pTrdSymbol'] == search_pattern) &
             (self.scrip_master_df['pInstType'] == 'OPTIDX') &
-            (self.scrip_master_df['pExchSeg'].isin(['nse_fo', 'NSE_FO', 'bse_fo', 'BSE_FO']))
-            ]
+            (self.scrip_master_df['pExchSeg'].isin(exchange_segments))
+        ]
 
         if len(matching_instruments) == 0:
             # Log what we have for debugging
-            if self.test_mode:
+            if self.test_mode or index_name == 'SENSEX':
                 available = self.scrip_master_df[
                     (self.scrip_master_df['pTrdSymbol'].str.contains(index_name, na=False)) &
                     (self.scrip_master_df['pTrdSymbol'].str.contains(expiry_str_short, na=False)) &
                     (self.scrip_master_df['pOptionType'] == option_type)
-                    ]
+                ]
                 if not available.empty:
                     logger.info(f"Available similar options:")
                     for _, row in available.head(3).iterrows():
-                        logger.info(f"  {row['pTrdSymbol']} - Strike: {row['pStrikePrice']}")
+                        logger.info(f"  {row['pTrdSymbol']} - Strike: {row['pStrikePrice']} - Exchange: {row['pExchSeg']}")
 
             # Try with contains for more flexible matching
             matching_instruments = self.scrip_master_df[
