@@ -281,7 +281,7 @@ class KotakOptionsTrader:
             'BANKNIFTY': 100,
             'FINNIFTY': 50,
             'MIDCPNIFTY': 25,
-            'SENSEX': 100
+            'SENSEX': 500  # Changed from 100 to 500 for SENSEX
         }
 
         self.itm_strikes = 1  # ITM strikes to go
@@ -483,7 +483,7 @@ class KotakOptionsTrader:
 
                         # Filter for options (OPTIDX for index options)
                         bse_options = bse_df[
-                            (bse_df['pInstType'].str.upper().isin(['OPTIDX', 'OPTSTK'])) |
+                            (bse_df['pInstType'].str.upper().isin(['OPTIDX', 'OPTSTK', 'SO', 'IO'])) |  # Added SO, IO
                             (bse_df['pTrdSymbol'].str.contains('SENSEX', na=False))
                             ]
 
@@ -995,49 +995,72 @@ class KotakOptionsTrader:
 
         logger.info(f"Looking for trading symbol pattern: {search_pattern}")
 
+        # For SENSEX, first check what strikes are actually available
+        if index_name == 'SENSEX':
+            # Get all SENSEX options for this expiry and type
+            sensex_options = self.scrip_master_df[
+                (self.scrip_master_df['pTrdSymbol'].str.startswith(f'SENSEX{expiry_str_short}', na=False)) &
+                (self.scrip_master_df['pOptionType'] == option_type) &
+                (self.scrip_master_df['pInstType'] == 'OPTIDX')
+                ]
+
+            if not sensex_options.empty:
+                available_strikes = sorted(sensex_options['pStrikePrice'].unique())
+                logger.info(
+                    f"Available SENSEX {option_type} strikes for {expiry_str_short}: {[int(s) for s in available_strikes[:10]]}")
+
+                # Find closest available strike
+                closest_strike = min(available_strikes, key=lambda x: abs(x - strike_price))
+                if abs(closest_strike - strike_price) > 500:  # If too far, log warning
+                    logger.warning(
+                        f"Closest SENSEX strike {closest_strike} is {abs(closest_strike - strike_price)} points away from requested {strike_price}")
+
+                # Use the closest strike for SENSEX
+                if closest_strike != strike_price:
+                    logger.info(f"Using closest available SENSEX strike: {closest_strike} instead of {strike_price}")
+                    strike_price = closest_strike
+                    search_pattern = f'{index_name}{expiry_str_short}{int(strike_price)}{option_type}'
+
         # Determine exchange based on index
         if index_name == 'SENSEX':
-            exchange_segments = ['bse_fo', 'BSE_FO', 'BSE_F&O_CM']
+            exchange_segments = ['bse_fo', 'BSE_FO', 'BSE_F&O_CM', 'bse_fo']  # Added lowercase
         else:
             exchange_segments = ['nse_fo', 'NSE_FO']
 
         # Search by exact trading symbol
         matching_instruments = self.scrip_master_df[
             (self.scrip_master_df['pTrdSymbol'] == search_pattern) &
-            (self.scrip_master_df['pInstType'] == 'OPTIDX') &
-            (self.scrip_master_df['pExchSeg'].isin(exchange_segments))
-        ]
+            (self.scrip_master_df['pInstType'] == 'OPTIDX')
+            ]
+
+        # For SENSEX, don't filter by exchange segment in the first pass
+        if index_name != 'SENSEX':
+            matching_instruments = matching_instruments[
+                matching_instruments['pExchSeg'].isin(exchange_segments)
+            ]
 
         if len(matching_instruments) == 0:
-            # Log what we have for debugging
-            if self.test_mode or index_name == 'SENSEX':
+            # For SENSEX, try without strict exchange filter
+            if index_name == 'SENSEX':
+                matching_instruments = self.scrip_master_df[
+                    (self.scrip_master_df['pTrdSymbol'] == search_pattern) &
+                    (self.scrip_master_df['pInstType'].isin(['OPTIDX', 'SO', 'IO']))  # Include SO/IO types
+                    ]
+
+            if len(matching_instruments) == 0:
+                # Log what we have for debugging
                 available = self.scrip_master_df[
                     (self.scrip_master_df['pTrdSymbol'].str.contains(index_name, na=False)) &
                     (self.scrip_master_df['pTrdSymbol'].str.contains(expiry_str_short, na=False)) &
                     (self.scrip_master_df['pOptionType'] == option_type)
-                ]
+                    ]
                 if not available.empty:
                     logger.info(f"Available similar options:")
-                    for _, row in available.head(3).iterrows():
-                        logger.info(f"  {row['pTrdSymbol']} - Strike: {row['pStrikePrice']} - Exchange: {row['pExchSeg']}")
+                    for _, row in available.head(5).iterrows():
+                        logger.info(
+                            f"  {row['pTrdSymbol']} - Strike: {row['pStrikePrice']} - Exchange: {row['pExchSeg']} - InstType: {row['pInstType']}")
 
-            # Try with contains for more flexible matching
-            matching_instruments = self.scrip_master_df[
-                (self.scrip_master_df['pTrdSymbol'].str.contains(
-                    f'^{index_name}{expiry_str_short}.*{int(strike_price)}{option_type}$', regex=True, na=False)) &
-                (self.scrip_master_df['pStrikePrice'] == float(strike_price)) &
-                (self.scrip_master_df['pOptionType'] == option_type) &
-                (self.scrip_master_df['pInstType'] == 'OPTIDX')
-                ]
-
-            # For NIFTY, exclude variants
-            if index_name == 'NIFTY':
-                matching_instruments = matching_instruments[
-                    ~matching_instruments['pTrdSymbol'].str.contains('BANKNIFTY|FINNIFTY|MIDCPNIFTY', na=False)
-                ]
-
-        if len(matching_instruments) == 0:
-            return None
+                return None
 
         if len(matching_instruments) > 1:
             logger.warning(f"Multiple instruments found ({len(matching_instruments)}), using first one")
