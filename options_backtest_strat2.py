@@ -876,6 +876,16 @@ def run_live_trading(signal_state, trader):
 
     print("✅ Live trading started. Will run every 25 minutes until 3:30 PM IST.")
 
+    # Wait for current candle to complete if starting mid-candle
+    next_run = get_next_candle_time()
+    wait_time = (next_run - datetime.now()).total_seconds()
+
+    if wait_time > 0:
+        print(f"\n⏳ Waiting for current candle to complete...")
+        print(f"First run will be at {next_run.strftime('%H:%M:%S')} (candle close + 30s)")
+        print(f"Waiting {int(wait_time)} seconds...\n")
+        time.sleep(wait_time)
+
     indices = [
         {"13": "NIFTY"},
         {"25": "BANKNIFTY"},
