@@ -201,18 +201,23 @@ def simulate_streaming_live_mode(base_months=5, total_months=10):
         all_trades = []
 
         # Process each new bar
+        print(f"Pre-building datasets for {len(stream_df)} bars...")
+        all_datasets = []
+        current_data = base_df.copy()
+
         for i in range(len(stream_df)):
-            # Create current dataset (base + streamed bars)
-            current_df = pd.concat([
-                base_df.iloc[1:],  # Drop oldest bar
-                stream_df.iloc[:i + 1]  # Add new bars up to current
-            ])
+            # Add new bar
+            new_bar = stream_df.iloc[i:i + 1]
+            current_data = pd.concat([current_data, new_bar])
 
-            # Update base_df for next iteration
-            if i > 0:
-                base_df = current_df.iloc[:-1].copy()
+            # Keep rolling window (drop oldest if needed)
+            if len(current_data) > len(base_df) + i + 1:
+                current_data = current_data.iloc[1:]
 
-            # Run strategy on current data
+            all_datasets.append(current_data.copy())
+
+        # Process each pre-built dataset
+        for i, current_df in enumerate(all_datasets):
             trades = process_single_bar(symbol, index, current_df, sim_signal_state)
             all_trades.extend(trades)
 
@@ -236,9 +241,13 @@ def process_single_bar(symbol, index, df, signal_state):
     trades = []
 
     # Build features
-    features = build_features(df)
+    recent_df = df.tail(min(500, len(df)))
+    features = build_features(recent_df)
     if len(features) < LOOKAHEAD:
         return trades
+
+    # Align features with original df index
+    features = features.reindex(df.index[-len(features):])
 
     # Generate predictions
     predictions = predict_labels(features, df['close'])

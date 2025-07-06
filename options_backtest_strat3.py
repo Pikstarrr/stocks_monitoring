@@ -1,14 +1,18 @@
 # momentum_x_optimized.py - High accuracy trading strategy with signal persistence
+import csv
 import time
 import json
 import os
 from datetime import datetime, timedelta
-from firebase_admin import credentials, firestore, initialize_app
 
+from firebase_admin import credentials, firestore, initialize_app
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
 from google.cloud.firestore_v1 import ArrayUnion
+from numba import jit
 from sklearn.metrics.pairwise import manhattan_distances
 
 from send_mail import send_email
@@ -133,6 +137,44 @@ class SignalState:
         self.save_state()
 
 
+class TradeRecorder:
+    """Records trades during backtest"""
+
+    def __init__(self):
+        self.trades = []
+        self.positions = []
+        self.current_position = None
+        self.entry_price = None
+        self.entry_time = None
+
+    def record_trade(self, timestamp, index_name, signal_type, price):
+        self.trades.append({
+            'timestamp': timestamp,
+            'index': index_name,
+            'action': signal_type,
+            'price': price
+        })
+
+        # Track positions for P&L
+        if signal_type in ['BUY', 'SHORT']:
+            self.current_position = signal_type
+            self.entry_price = price
+            self.entry_time = timestamp
+        elif signal_type in ['SELL', 'COVER']:
+            if self.current_position:
+                profit = price - self.entry_price if self.current_position == 'BUY' else self.entry_price - price
+                self.positions.append({
+                    'index': index_name,
+                    'entry_time': self.entry_time,
+                    'exit_time': timestamp,
+                    'entry_price': self.entry_price,
+                    'exit_price': price,
+                    'type': self.current_position,
+                    'profit': profit,
+                    'profit_pct': (profit / self.entry_price) * 100
+                })
+            self.current_position = None
+
 # === Feature Calculation ===
 def build_features(df):
     """Build technical indicator features"""
@@ -142,24 +184,6 @@ def build_features(df):
         f.name = f"{kind}_{param_a}_{param_b}"
         features.append(f)
     return pd.concat(features, axis=1).dropna()
-
-
-def normalize_features(features_df):
-    """Normalize features using rolling statistics for consistency"""
-    normalized = pd.DataFrame(index=features_df.index)
-
-    for col in features_df.columns:
-        # Use rolling normalization to avoid lookahead bias
-        rolling_mean = features_df[col].rolling(window=100, min_periods=20).mean()
-        rolling_std = features_df[col].rolling(window=100, min_periods=20).std()
-
-        # Avoid division by zero
-        rolling_std = rolling_std.replace(0, 1)
-
-        normalized[col] = (features_df[col] - rolling_mean) / rolling_std
-
-    return normalized.fillna(0)
-
 
 def save_historical_data(symbols_dict, months=10):
     """Fetch and save 10 months of data locally"""
@@ -179,92 +203,16 @@ def save_historical_data(symbols_dict, months=10):
         df.to_csv(f"{data_dir}/{index}_{months}months.csv")
 
 
-def load_historical_data(index):
+def load_historical_data(index, filename=None):
     """Load saved historical data"""
-    filename = f"historical_data/{index}_10months.pkl"
+
+    if filename is None:
+        filename = f"historical_data/{index}_10months.pkl"
+
     if os.path.exists(filename):
-        return pd.read_pickle(filename)
+        return pd.read_csv(filename)
     else:
         raise FileNotFoundError(f"Please run save_historical_data first. {filename} not found.")
-
-
-def simulate_streaming_live_mode(base_months=5, total_months=10):
-    """Simulate live trading by streaming data bar by bar"""
-    indices = {
-        "13": "NIFTY",
-        "25": "BANKNIFTY",
-        "51": "SENSEX",
-        "27": "FINNIFTY",
-        "442": "MIDCPNIFTY"
-    }
-
-    # First, save all data if not exists
-    if not os.path.exists("historical_data/NIFTY_10months.pkl"):
-        print("Fetching and saving historical data...")
-        save_historical_data(indices, months=total_months)
-
-    results = {}
-
-    for symbol, index in indices.items():
-        print(f"\n{'=' * 60}")
-        print(f"Simulating {index}")
-        print(f"{'=' * 60}")
-
-        # Load full data
-        full_df = load_historical_data(index)
-
-        # Calculate split point (first 5 months for base)
-        total_bars = len(full_df)
-        base_bars = int(total_bars * (base_months / total_months))
-
-        # Split data
-        base_df = full_df.iloc[:base_bars].copy()
-        stream_df = full_df.iloc[base_bars:].copy()
-
-        print(f"Pre-building datasets for {len(stream_df)} bars...")
-
-        # Pre-calculate features for base dataset to improve efficiency
-        base_features = build_features(base_df)
-
-        print(f"Base data: {len(base_df)} bars, Stream data: {len(stream_df)} bars")
-
-        # Initialize signal state for simulation
-        sim_signal_state = SignalState(filepath=f"sim_state_{index}.json")
-
-        # Track all trades
-        all_trades = []
-
-        # Process each new bar
-        for i in range(len(stream_df)):
-            # Create current dataset maintaining MAX_BARS_BACK limit
-            if i == 0:
-                current_df = base_df.copy()
-            else:
-                # Concatenate all data up to current point
-                current_df = pd.concat([base_df, stream_df.iloc[:i + 1]])
-
-                # Keep only last MAX_BARS_BACK bars
-                if len(current_df) > MAX_BARS_BACK:
-                    current_df = current_df.iloc[-MAX_BARS_BACK:].copy()
-
-            # Run strategy on current data
-            trades = process_single_bar(symbol, index, current_df, sim_signal_state)
-            all_trades.extend(trades)
-
-            # Log progress every 100 bars
-            if i % 100 == 0:
-                print(f"Processed {i}/{len(stream_df)} bars, Trades so far: {len(all_trades)}")
-
-        results[index] = {
-            'trades': all_trades,
-            'final_state': sim_signal_state.state
-        }
-
-        # Clean up simulation state
-        os.remove(f"sim_state_{index}.json")
-
-    return results
-
 
 def validate_minimum_data_requirements(df, index_name):
     """Ensure we have minimum data for reliable predictions"""
@@ -283,146 +231,6 @@ def validate_minimum_data_requirements(df, index_name):
         return False
 
     return True
-
-def process_single_bar(symbol, index, df, signal_state):
-    """Process strategy for a single point in time"""
-    trades = []
-
-    # Ensure we have consistent history window
-    if len(df) > MAX_BARS_BACK:
-        df = df.iloc[-MAX_BARS_BACK:].copy()
-
-    # Validate minimum data requirements
-    if not validate_minimum_data_requirements(df, index):
-        return trades
-
-    # Build features
-    features = build_features(df)
-    if len(features) < LOOKAHEAD:
-        return trades
-
-    # Generate predictions
-    predictions = predict_labels(features, df['close'])
-
-    # Get current values
-    current_signal = predictions.iloc[-1]
-    current_time = df.index[-1]
-    current_price = df['close'].iloc[-1]
-
-    # Get kernel signals
-    bullish, bearish, rk, gk = get_kernel_signals(df['close'])
-    current_bullish = bullish.iloc[-1]
-    current_bearish = bearish.iloc[-1]
-
-    # Get current position
-    current_position = signal_state.get_position(index)
-    bars_held = signal_state.get_bars_held(index)
-
-    # Calculate ATR
-    atr = calculate_atr(df)
-    current_atr = atr.iloc[-1] if len(atr) > 0 and not pd.isna(atr.iloc[-1]) else 0
-
-    action_taken = None
-
-    # Calculate all filters
-    current_vol_filter = calculate_volatility_filter(df['close'], USE_VOLATILITY_FILTER)
-    current_regime_filter = calculate_regime_filter(df['close'], REGIME_THRESHOLD, USE_REGIME_FILTER)
-
-    # ADX Filter
-    if USE_ADX_FILTER:
-        adx = calculate_adx(df, period=14)  # Note: period is typically 14, threshold is 20
-        current_adx_filter = adx.iloc[-1] > ADX_THRESHOLD if len(adx) > 0 else False
-    else:
-        current_adx_filter = True
-
-    # EMA Filter
-    if USE_EMA_FILTER:
-        ema = df['close'].ewm(span=EMA_PERIOD, adjust=False).mean()
-        ema_uptrend = df['close'].iloc[-1] > ema.iloc[-1]
-        ema_downtrend = df['close'].iloc[-1] < ema.iloc[-1]
-    else:
-        ema_uptrend = True
-        ema_downtrend = True
-
-    # Apply all filters
-    all_filters = current_vol_filter and current_regime_filter and current_adx_filter
-
-    # Directional filters for entries
-    long_filters = all_filters and ema_uptrend
-    short_filters = all_filters and ema_downtrend
-
-    # Exit logic
-    if current_position == 'LONG':
-        signal_state.increment_bars_held(index)
-        bars_held = signal_state.get_bars_held(index)
-        entry_info = signal_state.get_entry_info(index)
-        entry_price = entry_info.get('price', current_price)
-
-        # Check both strict and dynamic exit conditions
-        dynamic_exit = check_dynamic_exit_conditions(df, 'LONG', bars_held) if USE_DYNAMIC_EXITS else False
-
-        if current_bearish or bars_held >= STRICT_EXIT_BARS or dynamic_exit or (
-                current_atr > 0 and current_price < entry_price - current_atr):
-            action_taken = "SELL"
-            signal_state.update_position(index, None)
-            signal_state.reset_bars_held(index)
-            trades.append({
-                'time': current_time,
-                'action': action_taken,
-                'price': current_price,
-                'signal': current_signal
-            })
-
-    elif current_position == 'SHORT':
-        signal_state.increment_bars_held(index)
-        bars_held = signal_state.get_bars_held(index)
-        entry_info = signal_state.get_entry_info(index)
-        entry_price = entry_info.get('price', current_price)
-
-        # Check both strict and dynamic exit conditions
-        dynamic_exit = check_dynamic_exit_conditions(df, 'SHORT', bars_held) if USE_DYNAMIC_EXITS else False
-
-        if current_bullish or bars_held >= STRICT_EXIT_BARS or dynamic_exit or (
-                current_atr > 0 and current_price > entry_price + current_atr):
-            action_taken = "COVER"
-            signal_state.update_position(index, None)
-            signal_state.reset_bars_held(index)
-            trades.append({
-                'time': current_time,
-                'action': action_taken,
-                'price': current_price,
-                'signal': current_signal
-            })
-
-    # Entry logic - simplified to match original
-    elif current_position is None:
-        if current_signal == 1 and current_bullish and long_filters:
-            action_taken = "BUY"
-            signal_state.update_position(index, 'LONG', float(current_price), current_time)
-            signal_state.reset_bars_held(index)
-            trades.append({
-                'time': current_time,
-                'action': action_taken,
-                'price': current_price,
-                'signal': current_signal
-            })
-
-        elif current_signal == -1 and current_bearish and short_filters:
-            action_taken = "SHORT"
-            signal_state.update_position(index, 'SHORT', float(current_price), current_time)
-            signal_state.reset_bars_held(index)
-            trades.append({
-                'time': current_time,
-                'action': action_taken,
-                'price': current_price,
-                'signal': current_signal
-            })
-
-    # Update signal state
-    signal_state.update_signal(index, int(current_signal) if hasattr(current_signal, 'item') else current_signal)
-
-    return trades
-
 
 def calculate_adx(df, period=14):
     """Calculate ADX (Average Directional Index) matching Pine Script"""
@@ -474,48 +282,6 @@ def calculate_adx(df, period=14):
 
     return adx
 
-def compare_results():
-    """Compare backtest vs simulated live results"""
-    print("\nRunning comparison...")
-
-    # Run normal backtest on last 5 months
-    backtest_results = run_backtest_analysis()
-
-    # Run simulated live mode
-    sim_results = simulate_streaming_live_mode()
-
-    # Compare
-    print("\n" + "=" * 80)
-    print("COMPARISON RESULTS")
-    print("=" * 80)
-
-    for index in ["NIFTY", "BANKNIFTY", "SENSEX", "FINNIFTY", "MIDCPNIFTY"]:
-        if index in backtest_results and index in sim_results:
-            bt_trades = backtest_results[index]['performance']['total_trades']
-            bt_winrate = backtest_results[index]['performance']['win_rate']
-            sim_trades = len([t for t in sim_results[index]['trades'] if t['action'] in ['BUY', 'SHORT']])
-
-            # Calculate sim win rate
-            sim_positions = []
-            sim_trades_list = sim_results[index]['trades']
-            for i in range(0, len(sim_trades_list) - 1, 2):
-                if i + 1 < len(sim_trades_list):
-                    entry = sim_trades_list[i]
-                    exit = sim_trades_list[i + 1]
-                    if entry['action'] in ['BUY', 'SHORT'] and exit['action'] in ['SELL', 'COVER']:
-                        profit = exit['price'] - entry['price'] if entry['action'] == 'BUY' else entry['price'] - exit[
-                            'price']
-                        sim_positions.append(profit > 0)
-
-            sim_winrate = (sum(sim_positions) / len(sim_positions) * 100) if sim_positions else 0
-
-            print(f"\n{index}:")
-            print(f"  Backtest: {bt_trades} trades @ {bt_winrate:.1f}% win rate")
-            print(f"  Simulated: {sim_trades} trades @ {sim_winrate:.1f}% win rate")
-            print(f"  Trade Count Match: {'✅' if abs(bt_trades - sim_trades) < 10 else '❌'}")
-            print(f"  Win Rate Match: {'✅' if abs(bt_winrate - sim_winrate) < 5 else '❌'}")
-
-
 # === ML Prediction Functions ===
 def predict_labels(features, close_series):
     """
@@ -560,15 +326,7 @@ def predict_labels(features, close_series):
             continue
 
         # Calculate Lorentzian distances to past data only
-        distances = []
-        for j in range(start_idx, i):
-            # Lorentzian distance calculation (matching Pine Script)
-            distance = 0
-            for k in range(X.shape[1]):  # For each feature
-                distance += np.log(1 + np.abs(X[i, k] - X[j, k]))
-            distances.append(distance)
-
-        distances = np.array(distances)
+        distances = compute_lorentzian_distances(X, i, start_idx, i)
 
         max_distance = np.percentile(distances, 30)  # Use top 25% most similar
         good_indices = np.where(distances <= max_distance)[0]
@@ -588,6 +346,22 @@ def predict_labels(features, close_series):
             predictions.append(int(np.sign(vote)))
 
     return pd.Series(predictions, index=features.index)
+
+
+@jit(nopython=True)
+def compute_lorentzian_distances(X, i, start_idx, end_idx):
+    """Compute distances from point i to points [start_idx:end_idx]"""
+    num_points = end_idx - start_idx
+    num_features = X.shape[1]
+    distances = np.zeros(num_points)
+
+    for j in range(num_points):
+        dist = 0.0
+        for k in range(num_features):
+            dist += np.log(1 + np.abs(X[i, k] - X[start_idx + j, k]))
+        distances[j] = dist
+
+    return distances
 
 
 def calculate_volatility_filter(close, use_filter=True):
@@ -635,35 +409,6 @@ def calculate_regime_filter(close, threshold=-0.1, use_filter=True):
         return slope > threshold
 
     return True
-
-def validate_label_generation(df):
-    """Validate that labels are generated consistently"""
-    features = build_features(df)
-    if len(features) < LOOKAHEAD * 2:
-        return True
-
-    # Check a few random points
-    test_indices = np.random.choice(range(LOOKAHEAD, len(features) - LOOKAHEAD),
-                                    size=min(10, len(features) - LOOKAHEAD * 2),
-                                    replace=False)
-
-    for idx in test_indices:
-        current_close = df['close'].iloc[idx]
-        future_close = df['close'].iloc[idx + LOOKAHEAD]
-        delta = (future_close - current_close) / current_close
-
-        if abs(delta) < LABEL_THRESHOLD:
-            expected = 0
-        elif delta > LABEL_THRESHOLD:
-            expected = 1
-        else:
-            expected = -1
-
-        if DEBUG:
-            print(f"Label validation at {idx}: delta={delta:.4f}, expected={expected}")
-
-    return True
-
 
 # === Technical Analysis Functions ===
 def calculate_atr(df, period=14):
@@ -746,129 +491,26 @@ def check_dynamic_exit_conditions(df, position, bars_held):
 
     return False
 
-
-# === Backtest Function ===
-def backtest(df, predictions):
-    """Backtest strategy with unified logic"""
-    atr = calculate_atr(df)
-    bullish, bearish, rk, gk = get_kernel_signals(df['close'])
-
-    # Calculate filters once for entire series
-    vol_filter = pd.Series([calculate_volatility_filter(df['close'][:i + 1], USE_VOLATILITY_FILTER)
-                            for i in range(len(df))], index=df.index)
-    regime_filter = pd.Series([calculate_regime_filter(df['close'][:i + 1], REGIME_THRESHOLD, USE_REGIME_FILTER)
-                               for i in range(len(df))], index=df.index)
-
-    # ADX filter
-    if USE_ADX_FILTER:
-        adx = calculate_adx(df, period=14)
-        adx_filter = adx > ADX_THRESHOLD
-    else:
-        adx_filter = pd.Series([True] * len(df), index=df.index)
-
-    # EMA filter
-    if USE_EMA_FILTER:
-        ema = df['close'].ewm(span=EMA_PERIOD, adjust=False).mean()
-        ema_uptrend = df['close'] > ema
-        ema_downtrend = df['close'] < ema
-    else:
-        ema_uptrend = pd.Series([True] * len(df), index=df.index)
-        ema_downtrend = pd.Series([True] * len(df), index=df.index)
-
-    position = None
-    entry_price = 0
-    bar_hold = 0
-    trades = []
-    log_entries = []
-
-    for i in range(len(predictions)):
-        ts = df.index[i]
-        signal = predictions.iloc[i]
-        price = df['close'].iloc[i]
-        atr_val = atr.iloc[i] if i < len(atr) and not pd.isna(atr.iloc[i]) else 0
-
-        # Apply all filters
-        all_filters = vol_filter.iloc[i] and regime_filter.iloc[i] and adx_filter.iloc[i]
-        long_filters = all_filters and ema_uptrend.iloc[i]
-        short_filters = all_filters and ema_downtrend.iloc[i]
-
-        # Exit logic first
-        if position == 'LONG':
-            bar_hold += 1
-            # Check dynamic exit
-            dynamic_exit = False
-            if USE_DYNAMIC_EXITS and i >= 2:
-                if USE_KERNEL_SMOOTHING:
-                    bearish_cross = (rk.iloc[i] < gk.iloc[i] and rk.iloc[i - 1] >= gk.iloc[i - 1])
-                    momentum = df['close'].pct_change(5).iloc[i]
-                    momentum_exit = momentum < -0.002
-                    dynamic_exit = (bearish_cross or momentum_exit) and bar_hold > 0
-
-            # Exit conditions: bearish signal OR max bars OR dynamic exit OR stop loss
-            if bearish.iloc[i] or bar_hold >= STRICT_EXIT_BARS or dynamic_exit or (
-                    atr_val > 0 and price < entry_price - atr_val):
-                trades.append((ts, 'SELL', price))
-                position = None
-                bar_hold = 0
-
-        elif position == 'SHORT':
-            bar_hold += 1
-            # Check dynamic exit
-            dynamic_exit = False
-            if USE_DYNAMIC_EXITS and i >= 2:
-                if USE_KERNEL_SMOOTHING:
-                    bullish_cross = (rk.iloc[i] > gk.iloc[i] and rk.iloc[i - 1] <= gk.iloc[i - 1])
-                    momentum = df['close'].pct_change(5).iloc[i]
-                    momentum_exit = momentum > 0.002
-                    dynamic_exit = (bullish_cross or momentum_exit) and bar_hold > 0
-
-            # Exit conditions: bullish signal OR max bars OR dynamic exit OR stop loss
-            if bullish.iloc[i] or bar_hold >= STRICT_EXIT_BARS or dynamic_exit or (
-                    atr_val > 0 and price > entry_price + atr_val):
-                trades.append((ts, 'COVER', price))
-                position = None
-                bar_hold = 0
-
-        # Entry logic (only if no position) - WITH FILTERS
-        if position is None:
-            if signal == 1 and bullish.iloc[i] and long_filters:
-                trades.append((ts, 'BUY', price))
-                position = 'LONG'
-                entry_price = price
-                bar_hold = 0
-            elif signal == -1 and bearish.iloc[i] and short_filters:
-                trades.append((ts, 'SHORT', price))
-                position = 'SHORT'
-                entry_price = price
-                bar_hold = 0
-
-        log_entries.append({
-            "Time": ts,
-            "Signal": signal,
-            "Close": price,
-            "ATR": atr_val,
-            "Position": position,
-            "Bullish": bullish.iloc[i],
-            "Bearish": bearish.iloc[i]
-        })
-
-    return trades, pd.DataFrame(log_entries)
-
-
 # === Live Trading Function ===
-def process_symbol(symbol_dict, signal_state, trader, quote_data=None):
+def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='live', trade_recorder=None):
     """Process a single symbol for live trading - UNIFIED LOGIC"""
     symbol, index = next(iter(symbol_dict.items()))
 
-    # Fetch OHLC data
-    df = fetch_ohlc(symbol, interval=interval_time)
+    # Fetch data based on mode
+    if mode == 'live':
+        # Fetch OHLC data from API
+        df = fetch_ohlc(symbol, interval=interval_time)
 
-    if quote_data and 'last_price' in quote_data:
-        now = pd.Timestamp.now().floor("25min")
-        if now not in df.index or (datetime.now() - df.index[-1].to_pydatetime()).total_seconds() > 25 * 60:
-            ltp = float(quote_data['last_price'])
-            df.loc[now] = [ltp, ltp, ltp, ltp]
-            print(f"📊 Added live candle for {index} at {ltp}")
+        if quote_data and 'last_price' in quote_data:
+            now = pd.Timestamp.now().floor("25min")
+            if now not in df.index or (datetime.now() - df.index[-1].to_pydatetime()).total_seconds() > 25 * 60:
+                ltp = float(quote_data['last_price'])
+                df.loc[now] = [ltp, ltp, ltp, ltp]
+                print(f"📊 Added live candle for {index} at {ltp}")
+
+    elif mode == 'backtest':
+        # Load data from test.csv for backtest
+        df = load_historical_data(index, f"testing_data/{index}_test.csv")
 
     # Ensure we have consistent history window (SAME AS validate)
     if len(df) > MAX_BARS_BACK:
@@ -966,7 +608,7 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None):
             signal_state.reset_bars_held(index)
 
     # Entry logic - SAME AS validate (no new signal check!)
-    elif current_position is None:
+    if current_position is None:
         if current_signal == 1 and current_bullish and long_filters:
             action_taken = "BUY"
             signal_state.update_position(index, 'LONG', float(current_price), current_time)
@@ -997,16 +639,21 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None):
     if action_taken:
         print(f"📈 TRADE SIGNAL: {log_str}")
 
-        # Send alerts
-        subject = f"{index} SIGNAL: {action_taken}"
-        send_email(subject, log_str)
+        if mode == 'live':
+            # Send alerts
+            subject = f"{index} SIGNAL: {action_taken}"
+            send_email(subject, log_str)
 
-        # Update Firebase
-        doc_ref = db.collection("live_alerts").document(index)
-        doc_ref.update({"alerts": ArrayUnion([log_str])})
+            # Update Firebase
+            doc_ref = db.collection("live_alerts").document(index)
+            doc_ref.update({"alerts": ArrayUnion([log_str])})
 
-        # Execute trade
-        trader.execute_single_trade(timestamp=current_time, index_name=index, signal_type=action_taken)
+            # Execute trade
+            trader.execute_single_trade(timestamp=current_time, index_name=index, signal_type=action_taken)
+
+        elif mode == 'backtest' and trade_recorder:
+            # Record trade for backtest
+            trade_recorder.record_trade(current_time, index, action_taken, current_price)
     else:
         print(f"📊 {index}: {log_str}")
 
@@ -1050,9 +697,9 @@ def fetch_ohlc(symbol, interval=25, months=5):
 
 # === Backtest Analysis ===
 def run_backtest_analysis():
-    """Run comprehensive backtest on all indices"""
+    """Run comprehensive backtest using the same logic as live mode"""
     print("\n" + "=" * 80)
-    print("RUNNING BACKTEST ANALYSIS")
+    print("RUNNING BACKTEST ANALYSIS (UNIFIED LOGIC)")
     print("=" * 80 + "\n")
 
     indices = [
@@ -1063,118 +710,114 @@ def run_backtest_analysis():
         {"442": "MIDCPNIFTY"}
     ]
 
-    all_results = {}
+    # Use separate state file for backtest
+    backtest_state = SignalState(filepath="backtest_signal_state.json")
 
+    # Initialize trade recorders for each index
+    trade_recorders = {}
+
+    # Initialize trade recorder if not exists
     for index_dict in indices:
         symbol, index = next(iter(index_dict.items()))
-        print(f"\nBacktesting {index}...")
 
-        try:
-            # Fetch data
-            df = fetch_ohlc(symbol, interval=interval_time)
+        if index not in trade_recorders:
+            trade_recorders[index] = TradeRecorder()
 
-            if len(df) < 100:
-                print(f"Skipping {index}: insufficient data")
-                continue
+        while move_first_row(f'testing_data/{index}_input.csv', f"testing_data/{index}_test.csv"):
 
-            # Build features and predictions
-            features = build_features(df)
-            if len(features) < LOOKAHEAD:
-                print(f"Not enough features for {index}")
-                continue
+            try:
+                # Process using the SAME function as live mode
+                process_symbol(
+                    symbol_dict=index_dict,
+                    signal_state=backtest_state,
+                    trader=None,  # No trader in backtest
+                    quote_data=None,
+                    mode='backtest',
+                    trade_recorder=trade_recorders[index]
+                )
+            except Exception as e:
+                print(f"  Error processing {index}: {str(e)}")
 
-            predictions = predict_labels(features, df['close'])
+        # Analyze results
+        print("\n" + "=" * 80)
+        print("BACKTEST RESULTS")
+        print("=" * 80)
 
-            # Run backtest
-            trades, logs = backtest(df.loc[predictions.index], predictions)
+        all_results = {}
+        for index, recorder in trade_recorders.items():
+            if recorder.positions:
+                total_trades = len(recorder.positions)
+                winning_trades = sum(1 for p in recorder.positions if p['profit'] > 0)
+                total_profit = sum(p['profit'] for p in recorder.positions)
+                win_rate = (winning_trades / total_trades) * 100 if total_trades > 0 else 0
 
-            # Calculate performance
-            positions = []
-            for i in range(1, len(trades), 2):
-                if i < len(trades):
-                    t1, action1, price1 = trades[i - 1]
-                    t2, action2, price2 = trades[i]
-                    profit = price2 - price1 if action1 == 'BUY' else price1 - price2
-                    positions.append({
-                        'entry_time': t1,
-                        'entry_action': action1,
-                        'entry_price': price1,
-                        'exit_time': t2,
-                        'exit_action': action2,
-                        'exit_price': price2,
-                        'profit': profit,
-                        'profit_pct': (profit / price1) * 100
-                    })
-
-            # Calculate metrics
-            if positions:
-                total_trades = len(positions)
-                winning_trades = sum(1 for p in positions if p['profit'] > 0)
-                losing_trades = total_trades - winning_trades
-                total_profit = sum(p['profit'] for p in positions)
-                win_rate = (winning_trades / total_trades) * 100
-                avg_profit = total_profit / total_trades
-                avg_profit_pct = sum(p['profit_pct'] for p in positions) / total_trades
-
-                performance = {
-                    'total_trades': total_trades,
-                    'winning_trades': winning_trades,
-                    'losing_trades': losing_trades,
-                    'win_rate': win_rate,
-                    'total_profit': total_profit,
-                    'avg_profit': avg_profit,
-                    'avg_profit_pct': avg_profit_pct
-                }
-            else:
-                performance = {
-                    'total_trades': 0,
-                    'winning_trades': 0,
-                    'losing_trades': 0,
-                    'win_rate': 0,
-                    'total_profit': 0,
-                    'avg_profit': 0,
-                    'avg_profit_pct': 0
+                all_results[index] = {
+                    'trades': recorder.trades,
+                    'positions': recorder.positions,
+                    'performance': {
+                        'total_trades': total_trades,
+                        'winning_trades': winning_trades,
+                        'losing_trades': total_trades - winning_trades,
+                        'win_rate': win_rate,
+                        'total_profit': total_profit,
+                        'avg_profit': total_profit / total_trades if total_trades > 0 else 0,
+                        'avg_profit_pct': sum(
+                            p['profit_pct'] for p in recorder.positions) / total_trades if total_trades > 0 else 0
+                    }
                 }
 
-            all_results[index] = {
-                'trades': trades,
-                'positions': positions,
-                'performance': performance
-            }
+                print(f"\n{index} Performance:")
+                print(f"  Total Trades: {total_trades}")
+                print(f"  Win Rate: {win_rate:.2f}%")
+                print(f"  Total Profit: {total_profit:.2f}")
 
-            # Display results
-            print(f"\n{index} Performance:")
-            print(f"  Total Trades: {performance['total_trades']}")
-            print(f"  Win Rate: {performance['win_rate']:.2f}%")
-            print(f"  Winning Trades: {performance['winning_trades']}")
-            print(f"  Losing Trades: {performance['losing_trades']}")
-            print(f"  Total Profit Points: {performance['total_profit']:.2f}")
-            print(f"  Average Profit per Trade: {performance['avg_profit']:.2f}")
-            print(f"  Average Profit %: {performance['avg_profit_pct']:.2f}%")
+        # Save results
+        save_backtest_results(all_results)
 
-        except Exception as e:
-            print(f"Error backtesting {index}: {str(e)}")
-            import traceback
-            traceback.print_exc()
-
-    # Summary
-    print("\n" + "=" * 80)
-    print("OVERALL SUMMARY")
-    print("=" * 80)
-
-    total_trades = sum(r['performance']['total_trades'] for r in all_results.values())
-    total_wins = sum(r['performance']['winning_trades'] for r in all_results.values())
-    overall_win_rate = (total_wins / total_trades * 100) if total_trades > 0 else 0
-
-    print(f"\nTotal Trades Across All Indices: {total_trades}")
-    print(f"Overall Win Rate: {overall_win_rate:.2f}%")
-    print(f"Indices Tested: {len(all_results)}")
-
-    # Save results
-    save_backtest_results(all_results)
+        # Clean up backtest state file
+        if os.path.exists("backtest_signal_state.json"):
+            os.remove("backtest_signal_state.json")
 
     return all_results
 
+
+def move_first_row(input_path, test_path):
+    # Read all rows from input.csv
+    with open(input_path, newline='') as infile:
+        input_reader = list(csv.reader(infile))
+
+    # If there's only the header or less, return False
+    if len(input_reader) <= 1:
+        return False
+
+    header_input = input_reader[0]
+    first_data_row = input_reader[1]
+    remaining_input_rows = [header_input] + input_reader[2:]
+
+    # Save the updated input.csv with the first data row removed
+    with open(input_path, 'w', newline='') as infile:
+        writer = csv.writer(infile)
+        writer.writerows(remaining_input_rows)
+
+    # Read all rows from test.csv
+    with open(test_path, newline='') as testfile:
+        test_reader = list(csv.reader(testfile))
+
+    header_test = test_reader[0]
+    test_data_rows = test_reader[1:]
+
+    # Add the row from input and remove the first data row
+    test_data_rows.append(first_data_row)
+    if test_data_rows:
+        test_data_rows.pop(0)
+
+    # Save the updated test.csv
+    with open(test_path, 'w', newline='') as testfile:
+        writer = csv.writer(testfile)
+        writer.writerow(header_test)
+        writer.writerows(test_data_rows)
+
+    return True
 
 def save_backtest_results(all_results):
     """Save backtest results to CSV"""
@@ -1309,7 +952,7 @@ def run_live_trading(signal_state, trader):
         for index_dict in indices:
             try:
                 symbol, index = next(iter(index_dict.items()))
-                process_symbol(index_dict, signal_state, trader, quotes.get(symbol))
+                process_symbol(index_dict, signal_state, trader, quotes.get(symbol), mode='live')
             except Exception as e:
                 symbol, index = next(iter(index_dict.items()))
                 print(f"❌ Error processing {index}: {str(e)}")
@@ -1370,9 +1013,6 @@ if __name__ == '__main__':
         if sys.argv[1] == 'backtest':
             print("Running in BACKTEST mode...")
             run_backtest_analysis()
-        elif sys.argv[1] == 'validate':
-            print("Running validation mode...")
-            compare_results()
         elif sys.argv[1] == 'test_live':
             # Run live mode with test orders
             print("Running in TEST LIVE mode (no real trades)...")
