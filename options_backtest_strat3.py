@@ -1,19 +1,18 @@
 # momentum_x_optimized.py - High accuracy trading strategy with signal persistence
 import csv
+import shutil
 import time
 import json
 import os
+import random
 from datetime import datetime, timedelta
 
 from firebase_admin import credentials, firestore, initialize_app
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import multiprocessing
 import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
 from google.cloud.firestore_v1 import ArrayUnion
 from numba import jit
-from sklearn.metrics.pairwise import manhattan_distances
 
 from send_mail import send_email
 from strategy_features import compute_feature, rational_quadratic_kernel, gaussian_kernel
@@ -27,50 +26,51 @@ FEATURE_CONFIG = [
     ("WT", 10, 11),  # Feature 2
     ("CCI", 20, 1),  # Feature 3
     ("ADX", 20, 2),  # Feature 4
-    ("RSI", 9, 1),   # Feature 5
+    ("RSI", 9, 1),  # Feature 5
 ]
 
-# ML Parameters - EXACT match to Pine Script
+# ML Parameters - EXACT match to Pine Script inputs: close 8 5,000 5 1
 NEIGHBOR_COUNT = 8  # "defval" in Pine Script
-LUCKY_NUMBER = 3  # "defval" in Pine Script
-MAX_BARS_BACK = 2000  # Dynamic - can change to 5000 without code changes
+LUCKY_NUMBER = 3  # Not directly used for threshold
+MAX_BARS_BACK = 2000  # Can be 5000 based on Pine input
 LOOKAHEAD = 4
 FEATURE_COUNT = 5
-COLOR_COMPRESSION = 1  # "CC" in Pine Script
-STRICT_EXIT_BARS = 3
+COLOR_COMPRESSION = 1
+STRICT_EXIT_BARS = 4
 
-# Critical thresholds
-LABEL_THRESHOLD = 0.001  # Pine Script uses 0 for neutral zone
-CONFIDENCE_THRESHOLD = 3  # Minimum votes needed
+# Critical thresholds - TUNED FOR ACCURACY
+LABEL_THRESHOLD = 0.001  # Pine Script comment suggests this over 0
+CONFIDENCE_THRESHOLD = 2  # Require strong consensus (at least 3 votes)
 
 # Kernel Settings - EXACT match to Pine Script
 USE_KERNEL_FILTER = True  # "Trade with Kernel" ✓
 USE_KERNEL_SMOOTHING = True  # "Enhance Kernel Smoothing" ✓
-KERNEL_H = 10  # Lookback Window
+KERNEL_H = 8  # Lookback Window
 KERNEL_R = 8.0  # Relative Weighting
 KERNEL_X = 25  # Regression Level
-KERNEL_LAG = 1  # Lag
+KERNEL_LAG = 2  # Lag
 
-# Filter Settings - EXACT match to Pine Script
-USE_VOLATILITY_FILTER = False  # ✓
-USE_REGIME_FILTER = False  # ✓
+# Filter Settings - EXACT match to Pine Script DEFAULTS
+USE_VOLATILITY_FILTER = True  # Pine default is True
+USE_REGIME_FILTER = True  # Pine default is True
 REGIME_THRESHOLD = -0.1
 
-USE_ADX_FILTER = False  # ✗
+USE_ADX_FILTER = True  # Pine default is False
 ADX_THRESHOLD = 20
 
-# Additional Filters (currently disabled in your Pine Script)
-USE_EMA_FILTER = False  # ✗
-EMA_PERIOD = 50
-USE_SMA_FILTER = False  # ✗
+# Additional Filters (Pine Script defaults)
+USE_EMA_FILTER = False  # Pine default is False
+EMA_PERIOD = 200  # Pine default is 200
+USE_SMA_FILTER = False  # Pine default is False
 SMA_PERIOD = 200
 
 # Dynamic Exits
-USE_DYNAMIC_EXITS = False  # ✓
+USE_DYNAMIC_EXITS = True  # Pine default is False
 
 # Signal persistence file
 SIGNAL_STATE_FILE = "signal_state.json"
 DEBUG = True
+
 
 class SignalState:
     """Manages signal persistence across runs"""
@@ -175,6 +175,16 @@ class TradeRecorder:
                 })
             self.current_position = None
 
+def replace_csv_content(source_filename, dest_filename):
+    if not os.path.exists(source_filename):
+        raise FileNotFoundError(f"Source file '{source_filename}' does not exist.")
+
+    if not os.path.exists(dest_filename):
+        raise FileNotFoundError(f"Destination file '{dest_filename}' does not exist.")
+
+    shutil.copyfile(source_filename, dest_filename)
+    return True
+
 # === Feature Calculation ===
 def build_features(df):
     """Build technical indicator features"""
@@ -182,8 +192,32 @@ def build_features(df):
     for kind, param_a, param_b in FEATURE_CONFIG:
         f = compute_feature(df.copy(), kind, param_a, param_b)
         f.name = f"{kind}_{param_a}_{param_b}"
+
+        # Validate features are in expected range
+        if DEBUG and len(f) > 0:
+            if f.min() < -1.5 or f.max() > 1.5:
+                print(f"WARNING: Feature {f.name} out of expected range: [{f.min():.2f}, {f.max():.2f}]")
+
         features.append(f)
     return pd.concat(features, axis=1).dropna()
+
+
+def debug_signals(df, features, predictions, index_name):
+    """Debug function to analyze signal generation"""
+    if DEBUG:
+        # Count non-zero predictions
+        total_predictions = len(predictions)
+        buy_signals = (predictions == 1).sum()
+        sell_signals = (predictions == -1).sum()
+        neutral = (predictions == 0).sum()
+
+        print(f"\n=== DEBUG {index_name} ===")
+        print(f"Total bars: {total_predictions}")
+        print(f"Buy signals: {buy_signals} ({buy_signals / total_predictions * 100:.1f}%)")
+        print(f"Sell signals: {sell_signals} ({sell_signals / total_predictions * 100:.1f}%)")
+        print(f"Neutral: {neutral} ({neutral / total_predictions * 100:.1f}%)")
+        print("==================\n")
+
 
 def save_historical_data(symbols_dict, months=10):
     """Fetch and save 10 months of data locally"""
@@ -214,6 +248,7 @@ def load_historical_data(index, filename=None):
     else:
         raise FileNotFoundError(f"Please run save_historical_data first. {filename} not found.")
 
+
 def validate_minimum_data_requirements(df, index_name):
     """Ensure we have minimum data for reliable predictions"""
     min_bars_required = max(100, LOOKAHEAD * 10)  # At least 10x lookahead period
@@ -231,6 +266,7 @@ def validate_minimum_data_requirements(df, index_name):
         return False
 
     return True
+
 
 def calculate_adx(df, period=14):
     """Calculate ADX (Average Directional Index) matching Pine Script"""
@@ -282,86 +318,106 @@ def calculate_adx(df, period=14):
 
     return adx
 
-# === ML Prediction Functions ===
+
+@jit(nopython=True)
+def process_single_prediction(X, Y, i, max_lookback, neighbor_count, lucky_number):
+    """Process prediction for a single index using Pine Script logic"""
+    lastDistance = -1.0
+    distances = np.zeros(neighbor_count)
+    votes = np.zeros(neighbor_count, dtype=np.int32)
+    count = 0
+
+    # Process candidates with modulo 4 filter
+    start_idx = max(0, i - max_lookback)
+
+    for j in range(start_idx, i):
+        # Pine Script's modulo 4 filter
+        if (i - j) % 4 != 0:
+            continue
+
+        # Calculate Lorentzian distance
+        d = 0.0
+        for k in range(X.shape[1]):
+            d += np.log(1 + np.abs(X[i, k] - X[j, k]))
+
+        # Pine Script's selection logic: d >= lastDistance
+        if d >= lastDistance:
+            lastDistance = d
+
+            if count < neighbor_count:
+                distances[count] = d
+                votes[count] = Y[j]
+                count += 1
+            else:
+                # Keep only neighbor_count neighbors (shift arrays)
+                for idx in range(neighbor_count - 1):
+                    distances[idx] = distances[idx + 1]
+                    votes[idx] = votes[idx + 1]
+                distances[neighbor_count - 1] = d
+                votes[neighbor_count - 1] = Y[j]
+
+                # Update lastDistance to 75th percentile position
+                lastDistance = distances[int(neighbor_count * 3 / 4)]
+
+    # Return all votes, not just lucky_number
+    return votes[:count], count
+
+
 def predict_labels(features, close_series):
     """
-    Generate ML predictions using Lorentzian distance (matching Pine Script)
+    Generate ML predictions using Lorentzian distance (optimized with numba)
     """
     # Align indices
     common_index = features.index.intersection(close_series.index)
     features = features.loc[common_index]
     close_series = close_series.loc[common_index]
 
-    X = features.values
+    X = features.values.astype(np.float64)
     close = close_series.values
     n = len(X)
-    Y = np.zeros(n)
 
-    # Create labels with threshold
-    for i in range(LOOKAHEAD, n):
-        future_close = close[i]
-        current_close = close[i - LOOKAHEAD]
+    # Create labels array
+    Y = np.zeros(n, dtype=np.int32)
+    for i in range(n - LOOKAHEAD):
+        future_close = close[i + LOOKAHEAD]
+        current_close = close[i]
         delta = (future_close - current_close) / current_close
 
         if delta > LABEL_THRESHOLD:
-            Y[i - LOOKAHEAD] = 1
+            Y[i] = 1
         elif delta < -LABEL_THRESHOLD:
-            Y[i - LOOKAHEAD] = -1
+            Y[i] = -1
         else:
-            Y[i - LOOKAHEAD] = 0
+            Y[i] = 0
 
-    # Generate predictions for every row (THIS WAS INCORRECTLY INDENTED!)
-    predictions = []
-    for i in range(n):
-        if i < LOOKAHEAD:
-            predictions.append(0)
-            continue
+    # Generate predictions
+    predictions = np.zeros(n, dtype=np.int32)
 
-        # CRITICAL FIX: Only look at past data for neighbors
+    for i in range(LOOKAHEAD, n):
         max_lookback = min(i, MAX_BARS_BACK)
-        start_idx = max(0, i - max_lookback)
 
-        if i - start_idx < NEIGHBOR_COUNT:
-            predictions.append(0)
+        # Need enough historical data
+        if max_lookback < NEIGHBOR_COUNT:
+            predictions[i] = 0
             continue
 
-        # Calculate Lorentzian distances to past data only
-        distances = compute_lorentzian_distances(X, i, start_idx, i)
+        votes, count = process_single_prediction(
+            X, Y, i, max_lookback, NEIGHBOR_COUNT, LUCKY_NUMBER
+        )
 
-        max_distance = np.percentile(distances, 30)  # Use top 25% most similar
-        good_indices = np.where(distances <= max_distance)[0]
+        # Pine Script uses array.sum for ALL collected votes
+        if count > 0:
+            vote_sum = np.sum(votes[:count])
 
-        if len(good_indices) >= CONFIDENCE_THRESHOLD:
-            # Use only good quality neighbors
-            idx = good_indices[np.argsort(distances[good_indices])[:LUCKY_NUMBER]]
-            actual_indices = start_idx + idx
-            vote = np.sum(Y[actual_indices])
+            # Require strong consensus
+            if abs(vote_sum) >= CONFIDENCE_THRESHOLD:
+                predictions[i] = int(np.sign(vote_sum))
+            else:
+                predictions[i] = 0
         else:
-            vote = 0  # Not enough quality neighbors
-
-        # Apply confidence threshold
-        if abs(vote) < CONFIDENCE_THRESHOLD:
-            predictions.append(0)
-        else:
-            predictions.append(int(np.sign(vote)))
+            predictions[i] = 0
 
     return pd.Series(predictions, index=features.index)
-
-
-@jit(nopython=True)
-def compute_lorentzian_distances(X, i, start_idx, end_idx):
-    """Compute distances from point i to points [start_idx:end_idx]"""
-    num_points = end_idx - start_idx
-    num_features = X.shape[1]
-    distances = np.zeros(num_points)
-
-    for j in range(num_points):
-        dist = 0.0
-        for k in range(num_features):
-            dist += np.log(1 + np.abs(X[i, k] - X[start_idx + j, k]))
-        distances[j] = dist
-
-    return distances
 
 
 def calculate_volatility_filter(close, use_filter=True):
@@ -410,6 +466,7 @@ def calculate_regime_filter(close, threshold=-0.1, use_filter=True):
 
     return True
 
+
 # === Technical Analysis Functions ===
 def calculate_atr(df, period=14):
     """Calculate Average True Range"""
@@ -433,21 +490,10 @@ def get_kernel_signals(series, h=KERNEL_H, r=KERNEL_R, x=KERNEL_X, lag=KERNEL_LA
     yhat1 = rational_quadratic_kernel(series, h, r, x)
     yhat2 = gaussian_kernel(series, h - lag, x)
 
-    # Rate of change signals (for non-smoothed mode)
-    bullish_rate = yhat1 > yhat1.shift(1)
-    bearish_rate = yhat1 < yhat1.shift(1)
-
-    # Crossover signals (for smoothed mode)
-    bullish_smooth = yhat2 >= yhat1
-    bearish_smooth = yhat2 <= yhat1
-
-    # Use smoothing mode (matching your Pine Script settings)
-    if USE_KERNEL_SMOOTHING:
-        bullish = bullish_smooth
-        bearish = bearish_smooth
-    else:
-        bullish = bullish_rate
-        bearish = bearish_rate
+    # Since USE_KERNEL_SMOOTHING = True, we use crossover signals
+    # Pine Script: isBullishSmooth = yhat2 >= yhat1
+    bullish = yhat2 >= yhat1
+    bearish = yhat2 <= yhat1
 
     return bullish, bearish, yhat1, yhat2
 
@@ -470,7 +516,7 @@ def check_dynamic_exit_conditions(df, position, bars_held):
 
     if USE_KERNEL_SMOOTHING:
         if position == 'LONG':
-            # Exit conditions for long
+            # Exit conditions for long - check for crossunder
             bearish_cross = (yhat2.iloc[current_idx] < yhat1.iloc[current_idx] and
                              yhat2.iloc[current_idx - 1] >= yhat1.iloc[current_idx - 1])
 
@@ -480,7 +526,7 @@ def check_dynamic_exit_conditions(df, position, bars_held):
             return (bearish_cross or momentum_exit) and bars_held > 0
 
         elif position == 'SHORT':
-            # Exit conditions for short
+            # Exit conditions for short - check for crossover
             bullish_cross = (yhat2.iloc[current_idx] > yhat1.iloc[current_idx] and
                              yhat2.iloc[current_idx - 1] <= yhat1.iloc[current_idx - 1])
 
@@ -491,7 +537,7 @@ def check_dynamic_exit_conditions(df, position, bars_held):
 
     return False
 
-# === Live Trading Function ===
+
 def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='live', trade_recorder=None):
     """Process a single symbol for live trading - UNIFIED LOGIC"""
     symbol, index = next(iter(symbol_dict.items()))
@@ -508,7 +554,7 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
                 df.loc[now] = [ltp, ltp, ltp, ltp]
                 print(f"📊 Added live candle for {index} at {ltp}")
 
-    elif mode == 'backtest':
+    else:
         # Load data from test.csv for backtest
         df = load_historical_data(index, f"testing_data/{index}_test.csv")
 
@@ -528,6 +574,10 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
 
     # Generate predictions
     predictions = predict_labels(features, df['close'])
+
+    # Debug occasionally in backtest
+    if mode == 'backtest' and random.random() < 0.05:  # Debug 5% of backtest runs
+        debug_signals(df, features, predictions, index)
 
     # Get current values
     current_signal = predictions.iloc[-1]
@@ -569,12 +619,38 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
         ema_uptrend = True
         ema_downtrend = True
 
+    # SMA Filter
+    if USE_SMA_FILTER:
+        sma = df['close'].rolling(window=SMA_PERIOD).mean()
+        sma_uptrend = df['close'].iloc[-1] > sma.iloc[-1] if len(sma) > 0 and not pd.isna(sma.iloc[-1]) else True
+        sma_downtrend = df['close'].iloc[-1] < sma.iloc[-1] if len(sma) > 0 and not pd.isna(sma.iloc[-1]) else True
+    else:
+        sma_uptrend = True
+        sma_downtrend = True
+
     # Apply all filters
     all_filters = current_vol_filter and current_regime_filter and current_adx_filter
 
     # Directional filters for entries
-    long_filters = all_filters and ema_uptrend
-    short_filters = all_filters and ema_downtrend
+    long_filters = all_filters and ema_uptrend and sma_uptrend
+    short_filters = all_filters and ema_downtrend and sma_downtrend
+
+    # ===== SIGNAL PERSISTENCE LOGIC =====
+    # Get previous signal for persistence check
+    previous_signal = signal_state.get_last_signal(index)
+
+    # Apply signal persistence logic (Pine Script's nz(signal[1]))
+    if all_filters:  # Only update signal if filters pass
+        if current_signal != 0:
+            persisted_signal = current_signal
+        else:
+            persisted_signal = previous_signal
+    else:
+        persisted_signal = previous_signal
+
+    # Check if this is actually a NEW signal
+    is_new_signal = (persisted_signal != previous_signal) and (persisted_signal != 0)
+    # ===== END SIGNAL PERSISTENCE LOGIC =====
 
     # Exit logic (SAME AS validate)
     if current_position == 'LONG':
@@ -607,32 +683,33 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
             signal_state.update_position(index, None)
             signal_state.reset_bars_held(index)
 
-    # Entry logic - SAME AS validate (no new signal check!)
-    if current_position is None:
-        if current_signal == 1 and current_bullish and long_filters:
+    # Entry logic - WITH NEW SIGNAL CHECK
+    if current_position is None and is_new_signal:  # Added is_new_signal check
+        if persisted_signal == 1 and current_bullish and long_filters:
             action_taken = "BUY"
             signal_state.update_position(index, 'LONG', float(current_price), current_time)
             signal_state.reset_bars_held(index)
 
-        elif current_signal == -1 and current_bearish and short_filters:
+        elif persisted_signal == -1 and current_bearish and short_filters:
             action_taken = "SHORT"
             signal_state.update_position(index, 'SHORT', float(current_price), current_time)
             signal_state.reset_bars_held(index)
 
-    # Update signal state
-    signal_state.update_signal(index, int(current_signal) if hasattr(current_signal, 'item') else current_signal)
+    # Update signal state with PERSISTED signal
+    signal_state.update_signal(index, int(persisted_signal) if hasattr(persisted_signal, 'item') else persisted_signal)
 
     # Log and execute
     log_str = (
         f"INDEX: {index}, "
         f"Time: {current_time}, "
-        f"Signal: {current_signal}, "
+        f"Signal: {persisted_signal}, "  # Changed to show persisted signal
         f"Close: {current_price:.2f}, "
         f"ATR: {current_atr:.2f}, "
         f"Bullish: {current_bullish}, "
         f"Bearish: {current_bearish}, "
         f"Position: {current_position}, "
         f"Bars Held: {bars_held}, "
+        f"New Signal: {is_new_signal}, "  # Added to log
         f"Action: {action_taken}"
     )
 
@@ -655,7 +732,8 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
             # Record trade for backtest
             trade_recorder.record_trade(current_time, index, action_taken, current_price)
     else:
-        print(f"📊 {index}: {log_str}")
+        if DEBUG and mode == 'live':  # Only log in live mode to reduce noise
+            print(f"📊 {index}: {log_str}")
 
 
 # === Data Fetching ===
@@ -715,6 +793,9 @@ def run_backtest_analysis():
 
     # Initialize trade recorders for each index
     trade_recorders = {}
+
+    # replace_csv_content('testing_data/backup_input.csv', 'testing_data/NIFTY_input.csv')
+    # replace_csv_content('testing_data/backup_test.csv', 'testing_data/NIFTY_test.csv')
 
     # Initialize trade recorder if not exists
     for index_dict in indices:
@@ -818,6 +899,7 @@ def move_first_row(input_path, test_path):
         writer.writerows(test_data_rows)
 
     return True
+
 
 def save_backtest_results(all_results):
     """Save backtest results to CSV"""
