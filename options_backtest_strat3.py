@@ -32,7 +32,7 @@ FEATURE_CONFIG = [
 # ML Parameters - EXACT match to Pine Script inputs: close 8 5,000 5 1
 NEIGHBOR_COUNT = 8  # "defval" in Pine Script
 LUCKY_NUMBER = 3  # Not directly used for threshold
-MAX_BARS_BACK = 2000  # Can be 5000 based on Pine input
+MAX_BARS_BACK = 5000  # Can be 5000 based on Pine input
 LOOKAHEAD = 4
 FEATURE_COUNT = 5
 COLOR_COMPRESSION = 1
@@ -44,7 +44,7 @@ CONFIDENCE_THRESHOLD = 2  # Require strong consensus (at least 3 votes)
 
 # Kernel Settings - EXACT match to Pine Script
 USE_KERNEL_FILTER = True  # "Trade with Kernel" ✓
-USE_KERNEL_SMOOTHING = True  # "Enhance Kernel Smoothing" ✓
+USE_KERNEL_SMOOTHING = False  # "Enhance Kernel Smoothing" ✓
 KERNEL_H = 8  # Lookback Window
 KERNEL_R = 8.0  # Relative Weighting
 KERNEL_X = 25  # Regression Level
@@ -55,7 +55,7 @@ USE_VOLATILITY_FILTER = True  # Pine default is True
 USE_REGIME_FILTER = True  # Pine default is True
 REGIME_THRESHOLD = -0.1
 
-USE_ADX_FILTER = True  # Pine default is False
+USE_ADX_FILTER = False  # Pine default is False
 ADX_THRESHOLD = 20
 
 # Additional Filters (Pine Script defaults)
@@ -226,7 +226,7 @@ def save_historical_data(symbols_dict, months=10):
 
     for symbol, index in symbols_dict.items():
         print(f"Fetching {months} months data for {index}...")
-        df = fetch_ohlc(symbol, interval=25, months=months)
+        df = fetch_ohlc(symbol, interval=15, months=months)
 
         # Save as pickle for faster loading
         filename = f"{data_dir}/{index}_{months}months.pkl"
@@ -332,7 +332,7 @@ def process_single_prediction(X, Y, i, max_lookback, neighbor_count, lucky_numbe
 
     for j in range(start_idx, i):
         # Pine Script's modulo 4 filter
-        if (i - j) % 4 != 0:
+        if (i - j) % 4 == 0:
             continue
 
         # Calculate Lorentzian distance
@@ -782,10 +782,10 @@ def run_backtest_analysis():
 
     indices = [
         {"13": "NIFTY"},
-        {"25": "BANKNIFTY"},
-        {"51": "SENSEX"},
-        {"27": "FINNIFTY"},
-        {"442": "MIDCPNIFTY"}
+        # {"25": "BANKNIFTY"},
+        # {"51": "SENSEX"},
+        # {"27": "FINNIFTY"},
+        # {"442": "MIDCPNIFTY"}
     ]
 
     # Use separate state file for backtest
