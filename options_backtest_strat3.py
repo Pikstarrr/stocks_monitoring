@@ -347,7 +347,7 @@ def process_single_prediction_pine(X, Y, i, max_lookback, neighbor_count):
                 lastDistance = distances[int(neighbor_count * 3 / 4)]
 
     # Return sum of ALL votes
-    return np.sum(votes[:count])
+    return np.sum(votes[:count]), count
 
 
 def predict_labels(features, close_series):
@@ -387,12 +387,19 @@ def predict_labels(features, close_series):
             predictions[i] = 0
             continue
 
-        vote_sum = process_single_prediction_pine(
+        # In predict_labels, update this section:
+        vote_sum, vote_count = process_single_prediction_pine(
             X, Y, i, max_lookback, NEIGHBOR_COUNT
         )
 
-        if abs(vote_sum) >= CONFIDENCE_THRESHOLD:
-            predictions[i] = int(np.sign(vote_sum))
+        # ADD THIS: Require 60% consensus for high-quality signals
+        MIN_CONSENSUS_RATIO = 0.6
+        if vote_count >= LUCKY_NUMBER:  # Need at least 3 votes
+            consensus_ratio = abs(vote_sum) / vote_count
+            if abs(vote_sum) >= CONFIDENCE_THRESHOLD and consensus_ratio >= MIN_CONSENSUS_RATIO:
+                predictions[i] = int(np.sign(vote_sum))
+            else:
+                predictions[i] = 0
         else:
             predictions[i] = 0
 
@@ -464,15 +471,30 @@ def calculate_atr(df, period=14):
 
 
 def get_kernel_signals(series, h=KERNEL_H, r=KERNEL_R, x=KERNEL_X, lag=KERNEL_LAG):
-    """Calculate kernel signals for entry/exit - with smoothing enabled"""
-    # Match Pine Script kernel calculations
+    """Calculate kernel signals - MATCHING PINE SCRIPT EXACTLY"""
     yhat1 = rational_quadratic_kernel(series, h, r, x)
     yhat2 = gaussian_kernel(series, h - lag, x)
 
-    # Since USE_KERNEL_SMOOTHING = True, we use crossover signals
-    # Pine Script: isBullishSmooth = yhat2 >= yhat1
-    bullish = yhat2 >= yhat1
-    bearish = yhat2 <= yhat1
+    if USE_KERNEL_SMOOTHING:
+        # Smoothed mode uses crossovers
+        bullish = yhat2 >= yhat1
+        bearish = yhat2 <= yhat1
+    else:
+        # Non-smoothed mode uses RATE CHANGES
+        # Pine Script: isBullishChange = isBullishRate and wasBearishRate
+        if len(yhat1) < 3:
+            return pd.Series([False] * len(series), index=series.index), pd.Series([False] * len(series),
+                                                                                   index=series.index), yhat1, yhat2
+
+        # Rate calculations matching Pine Script exactly
+        wasBearishRate = yhat1.shift(2) > yhat1.shift(1)
+        wasBullishRate = yhat1.shift(2) < yhat1.shift(1)
+        isBearishRate = yhat1.shift(1) > yhat1
+        isBullishRate = yhat1.shift(1) < yhat1
+
+        # Changes (transitions) - this is what Pine Script uses for signals
+        bullish = isBullishRate & wasBearishRate
+        bearish = isBearishRate & wasBullishRate
 
     return bullish, bearish, yhat1, yhat2
 
@@ -755,11 +777,11 @@ def run_backtest_analysis():
     print("=" * 80 + "\n")
 
     indices = [
-        {"13": "NIFTY"},
+        # {"13": "NIFTY"},
         {"25": "BANKNIFTY"},
-        {"51": "SENSEX"},
-        {"27": "FINNIFTY"},
-        {"442": "MIDCPNIFTY"}
+        # {"51": "SENSEX"},
+        # {"27": "FINNIFTY"},
+        # {"442": "MIDCPNIFTY"}
     ]
 
     # Use separate state file for backtest
@@ -768,8 +790,8 @@ def run_backtest_analysis():
     # Initialize trade recorders for each index
     trade_recorders = {}
 
-    # replace_csv_content('testing_data/backup_input.csv', 'testing_data/NIFTY_input.csv')
-    # replace_csv_content('testing_data/backup_test.csv', 'testing_data/NIFTY_test.csv')
+    replace_csv_content('testing_data/backup_input.csv', 'testing_data/BANKNIFTY_input.csv')
+    replace_csv_content('testing_data/backup_test.csv', 'testing_data/BANKNIFTY_test.csv')
 
     # Initialize trade recorder if not exists
     for index_dict in indices:
