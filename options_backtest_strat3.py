@@ -53,7 +53,7 @@ KERNEL_LAG = 2  # Lag
 # Filter Settings - EXACT match to Pine Script DEFAULTS
 USE_VOLATILITY_FILTER = True  # Pine default is True
 USE_REGIME_FILTER = True  # Pine default is True
-REGIME_THRESHOLD = -0.1
+REGIME_THRESHOLD = 0.0
 
 USE_ADX_FILTER = False  # Pine default is False
 ADX_THRESHOLD = 20
@@ -201,24 +201,6 @@ def build_features(df):
         features.append(f)
     return pd.concat(features, axis=1).dropna()
 
-
-def debug_signals(df, features, predictions, index_name):
-    """Debug function to analyze signal generation"""
-    if DEBUG:
-        # Count non-zero predictions
-        total_predictions = len(predictions)
-        buy_signals = (predictions == 1).sum()
-        sell_signals = (predictions == -1).sum()
-        neutral = (predictions == 0).sum()
-
-        print(f"\n=== DEBUG {index_name} ===")
-        print(f"Total bars: {total_predictions}")
-        print(f"Buy signals: {buy_signals} ({buy_signals / total_predictions * 100:.1f}%)")
-        print(f"Sell signals: {sell_signals} ({sell_signals / total_predictions * 100:.1f}%)")
-        print(f"Neutral: {neutral} ({neutral / total_predictions * 100:.1f}%)")
-        print("==================\n")
-
-
 def save_historical_data(symbols_dict, months=10):
     """Fetch and save 10 months of data locally"""
     data_dir = "historical_data"
@@ -320,52 +302,57 @@ def calculate_adx(df, period=14):
 
 
 @jit(nopython=True)
-def process_single_prediction(X, Y, i, max_lookback, neighbor_count, lucky_number):
-    """Process prediction for a single index using Pine Script logic"""
+def process_single_prediction_pine(X, Y, i, max_lookback, neighbor_count):
+    """Process prediction using Pine Script's exact logic"""
     lastDistance = -1.0
     distances = np.zeros(neighbor_count)
     votes = np.zeros(neighbor_count, dtype=np.int32)
     count = 0
 
-    # Process candidates with modulo 4 filter
-    start_idx = max(0, i - max_lookback)
+    # Pine Script iterates forward through historical data
+    size = min(max_lookback, i)
 
-    for j in range(start_idx, i):
-        # Pine Script's modulo 4 filter
-        if (i - j) % 4 == 0:
+    for loop_idx in range(size):
+        # Pine Script's modulo: skip when loop_idx % 4 == 0
+        if loop_idx % 4 == 0:
             continue
 
-        # Calculate Lorentzian distance
+        # Historical index
+        hist_idx = i - size + loop_idx
+        if hist_idx >= i:
+            continue
+
+        # Lorentzian distance
         d = 0.0
         for k in range(X.shape[1]):
-            d += np.log(1 + np.abs(X[i, k] - X[j, k]))
+            d += np.log(1 + np.abs(X[i, k] - X[hist_idx, k]))
 
-        # Pine Script's selection logic: d >= lastDistance
+        # Pine Script: d >= lastDistance
         if d >= lastDistance:
             lastDistance = d
 
             if count < neighbor_count:
                 distances[count] = d
-                votes[count] = Y[j]
+                votes[count] = Y[hist_idx]
                 count += 1
             else:
-                # Keep only neighbor_count neighbors (shift arrays)
+                # Shift arrays
                 for idx in range(neighbor_count - 1):
                     distances[idx] = distances[idx + 1]
                     votes[idx] = votes[idx + 1]
                 distances[neighbor_count - 1] = d
-                votes[neighbor_count - 1] = Y[j]
+                votes[neighbor_count - 1] = Y[hist_idx]
 
-                # Update lastDistance to 75th percentile position
+                # Update threshold
                 lastDistance = distances[int(neighbor_count * 3 / 4)]
 
-    # Return all votes, not just lucky_number
-    return votes[:count], count
+    # Return sum of ALL votes
+    return np.sum(votes[:count])
 
 
 def predict_labels(features, close_series):
     """
-    Generate ML predictions using Lorentzian distance (optimized with numba)
+    Generate ML predictions using Lorentzian distance (optimized)
     """
     # Align indices
     common_index = features.index.intersection(close_series.index)
@@ -376,7 +363,7 @@ def predict_labels(features, close_series):
     close = close_series.values
     n = len(X)
 
-    # Create labels array
+    # Create labels - with CORRECT direction
     Y = np.zeros(n, dtype=np.int32)
     for i in range(n - LOOKAHEAD):
         future_close = close[i + LOOKAHEAD]
@@ -384,9 +371,9 @@ def predict_labels(features, close_series):
         delta = (future_close - current_close) / current_close
 
         if delta > LABEL_THRESHOLD:
-            Y[i] = 1
+            Y[i] = 1  # Long when price goes UP
         elif delta < -LABEL_THRESHOLD:
-            Y[i] = -1
+            Y[i] = -1  # Short when price goes DOWN
         else:
             Y[i] = 0
 
@@ -396,24 +383,16 @@ def predict_labels(features, close_series):
     for i in range(LOOKAHEAD, n):
         max_lookback = min(i, MAX_BARS_BACK)
 
-        # Need enough historical data
         if max_lookback < NEIGHBOR_COUNT:
             predictions[i] = 0
             continue
 
-        votes, count = process_single_prediction(
-            X, Y, i, max_lookback, NEIGHBOR_COUNT, LUCKY_NUMBER
+        vote_sum = process_single_prediction_pine(
+            X, Y, i, max_lookback, NEIGHBOR_COUNT
         )
 
-        # Pine Script uses array.sum for ALL collected votes
-        if count > 0:
-            vote_sum = np.sum(votes[:count])
-
-            # Require strong consensus
-            if abs(vote_sum) >= CONFIDENCE_THRESHOLD:
-                predictions[i] = int(np.sign(vote_sum))
-            else:
-                predictions[i] = 0
+        if abs(vote_sum) >= CONFIDENCE_THRESHOLD:
+            predictions[i] = int(np.sign(vote_sum))
         else:
             predictions[i] = 0
 
@@ -575,10 +554,6 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
     # Generate predictions
     predictions = predict_labels(features, df['close'])
 
-    # Debug occasionally in backtest
-    if mode == 'backtest' and random.random() < 0.05:  # Debug 5% of backtest runs
-        debug_signals(df, features, predictions, index)
-
     # Get current values
     current_signal = predictions.iloc[-1]
     current_time = df.index[-1]
@@ -648,22 +623,23 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
     else:
         persisted_signal = previous_signal
 
-    # Check if this is actually a NEW signal
-    is_new_signal = (persisted_signal != previous_signal) and (persisted_signal != 0)
     # ===== END SIGNAL PERSISTENCE LOGIC =====
 
-    # Exit logic (SAME AS validate)
+    # Exit logic - MORE LIKE PINE SCRIPT
     if current_position == 'LONG':
         signal_state.increment_bars_held(index)
         bars_held = signal_state.get_bars_held(index)
-        entry_info = signal_state.get_entry_info(index)
-        entry_price = entry_info.get('price', current_price)
 
-        # Check both strict and dynamic exit conditions
+        # Exit conditions:
+        # 1. Held for exactly 4 bars (strict exit)
+        # 2. New opposite signal appears before 4 bars
+        # 3. Dynamic exit (if enabled)
+
+        strict_exit = bars_held >= STRICT_EXIT_BARS
+        opposite_signal = persisted_signal == -1 and current_bearish and short_filters
         dynamic_exit = check_dynamic_exit_conditions(df, 'LONG', bars_held) if USE_DYNAMIC_EXITS else False
 
-        if current_bearish or bars_held >= STRICT_EXIT_BARS or dynamic_exit or (
-                current_atr > 0 and current_price < entry_price - current_atr):
+        if strict_exit or opposite_signal or dynamic_exit:
             action_taken = "SELL"
             signal_state.update_position(index, None)
             signal_state.reset_bars_held(index)
@@ -671,20 +647,19 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
     elif current_position == 'SHORT':
         signal_state.increment_bars_held(index)
         bars_held = signal_state.get_bars_held(index)
-        entry_info = signal_state.get_entry_info(index)
-        entry_price = entry_info.get('price', current_price)
 
-        # Check both strict and dynamic exit conditions
+        strict_exit = bars_held >= STRICT_EXIT_BARS
+        opposite_signal = persisted_signal == 1 and current_bullish and long_filters
         dynamic_exit = check_dynamic_exit_conditions(df, 'SHORT', bars_held) if USE_DYNAMIC_EXITS else False
 
-        if current_bullish or bars_held >= STRICT_EXIT_BARS or dynamic_exit or (
-                current_atr > 0 and current_price > entry_price + current_atr):
+        if strict_exit or opposite_signal or dynamic_exit:
             action_taken = "COVER"
             signal_state.update_position(index, None)
             signal_state.reset_bars_held(index)
 
-    # Entry logic - WITH NEW SIGNAL CHECK
-    if current_position is None and is_new_signal:  # Added is_new_signal check
+    # Entry logic - MORE LIKE PINE SCRIPT
+    if current_position is None:
+        # Check for entry signals (don't require is_new_signal!)
         if persisted_signal == 1 and current_bullish and long_filters:
             action_taken = "BUY"
             signal_state.update_position(index, 'LONG', float(current_price), current_time)
@@ -709,7 +684,6 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
         f"Bearish: {current_bearish}, "
         f"Position: {current_position}, "
         f"Bars Held: {bars_held}, "
-        f"New Signal: {is_new_signal}, "  # Added to log
         f"Action: {action_taken}"
     )
 
@@ -782,10 +756,10 @@ def run_backtest_analysis():
 
     indices = [
         {"13": "NIFTY"},
-        # {"25": "BANKNIFTY"},
-        # {"51": "SENSEX"},
-        # {"27": "FINNIFTY"},
-        # {"442": "MIDCPNIFTY"}
+        {"25": "BANKNIFTY"},
+        {"51": "SENSEX"},
+        {"27": "FINNIFTY"},
+        {"442": "MIDCPNIFTY"}
     ]
 
     # Use separate state file for backtest
@@ -1117,7 +1091,7 @@ if __name__ == '__main__':
         elif sys.argv[1] == 'save_data':
             print("Saving historical data...")
             indices = {"13": "NIFTY", "25": "BANKNIFTY", "51": "SENSEX", "27": "FINNIFTY", "442": "MIDCPNIFTY"}
-            save_historical_data(indices, months=10)
+            save_historical_data(indices, months=20)
     else:
         # Run live trading mode (REAL TRADES)
         print("Running in LIVE TRADING mode...")
