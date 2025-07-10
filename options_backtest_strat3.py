@@ -4,7 +4,6 @@ import shutil
 import time
 import json
 import os
-import random
 from datetime import datetime, timedelta
 
 from firebase_admin import credentials, firestore, initialize_app
@@ -36,15 +35,15 @@ MAX_BARS_BACK = 5000  # Can be 5000 based on Pine input
 LOOKAHEAD = 4
 FEATURE_COUNT = 5
 COLOR_COMPRESSION = 1
-STRICT_EXIT_BARS = 4
+STRICT_EXIT_BARS = 25
 
 # Critical thresholds - TUNED FOR ACCURACY
 LABEL_THRESHOLD = 0.001  # Pine Script comment suggests this over 0
-CONFIDENCE_THRESHOLD = 2  # Require strong consensus (at least 3 votes)
+CONFIDENCE_THRESHOLD = 1  # Require strong consensus (at least 3 votes)
 
 # Kernel Settings - EXACT match to Pine Script
 USE_KERNEL_FILTER = True  # "Trade with Kernel" ✓
-USE_KERNEL_SMOOTHING = False  # "Enhance Kernel Smoothing" ✓
+USE_KERNEL_SMOOTHING = True  # "Enhance Kernel Smoothing" ✓
 KERNEL_H = 8  # Lookback Window
 KERNEL_R = 8.0  # Relative Weighting
 KERNEL_X = 25  # Regression Level
@@ -53,7 +52,7 @@ KERNEL_LAG = 2  # Lag
 # Filter Settings - EXACT match to Pine Script DEFAULTS
 USE_VOLATILITY_FILTER = True  # Pine default is True
 USE_REGIME_FILTER = True  # Pine default is True
-REGIME_THRESHOLD = 0.0
+REGIME_THRESHOLD = -0.1
 
 USE_ADX_FILTER = False  # Pine default is False
 ADX_THRESHOLD = 20
@@ -539,6 +538,93 @@ def check_dynamic_exit_conditions(df, position, bars_held):
     return False
 
 
+def calculate_entry_quality(df, signal_type):
+    """Only enter if we can realistically hit 0.1% profit"""
+
+    # 1. Check recent volatility - need movement for profit
+    recent_moves = df['close'].pct_change().iloc[-10:].abs()
+    avg_move = recent_moves.mean() * 100  # Convert to percentage
+    has_volatility = avg_move >= 0.05  # Need at least 0.05% average moves
+
+    # 2. Check momentum alignment
+    momentum_1 = (df['close'].iloc[-1] - df['close'].iloc[-2]) / df['close'].iloc[-2] * 100
+    momentum_3 = (df['close'].iloc[-1] - df['close'].iloc[-4]) / df['close'].iloc[-4] * 100
+
+    if signal_type == 'LONG':
+        momentum_aligned = momentum_1 > 0 and momentum_3 > 0.05  # Rising momentum
+    else:
+        momentum_aligned = momentum_1 < 0 and momentum_3 < -0.05  # Falling momentum
+
+    # 3. Check if recent bars had 0.1% moves (proving it's possible)
+    recent_ranges = ((df['high'] - df['low']) / df['low'] * 100).iloc[-5:]
+    can_move = recent_ranges.max() >= 0.15  # At least one bar had 0.15% range
+
+    # 4. Kernel acceleration check
+    _, _, yhat1, _ = get_kernel_signals(df['close'])
+    if len(yhat1) >= 3:
+        kernel_accel = yhat1.iloc[-1] - yhat1.iloc[-3]
+        if signal_type == 'LONG':
+            kernel_accelerating = kernel_accel > 0
+        else:
+            kernel_accelerating = kernel_accel < 0
+    else:
+        kernel_accelerating = True
+
+    # All conditions must be true
+    quality_score = has_volatility and momentum_aligned and can_move and kernel_accelerating
+
+    # Debug logging
+    if DEBUG and not quality_score:
+        print(
+            f"  Entry Quality Failed - Vol:{has_volatility}, Mom:{momentum_aligned}, Move:{can_move}, Kernel:{kernel_accelerating}")
+
+    return quality_score
+
+
+def calculate_market_structure(df):
+    """Identify market regime - only trade with it"""
+    # Need enough data for all MAs
+    if len(df) < 200:
+        return 'NEUTRAL'
+
+    try:
+        sma20 = df['close'].rolling(20).mean()
+        sma50 = df['close'].rolling(50).mean()
+        sma200 = df['close'].rolling(200).mean()
+
+        # Market structure
+        bullish_structure = (
+                df['close'].iloc[-1] > sma20.iloc[-1] > sma50.iloc[-1] > sma200.iloc[-1]
+        )
+
+        bearish_structure = (
+                df['close'].iloc[-1] < sma20.iloc[-1] < sma50.iloc[-1] < sma200.iloc[-1]
+        )
+
+        # Additional strength check - MAs should be properly spaced
+        if bullish_structure:
+            # Check if MAs are spreading apart (strong trend)
+            ma_spread = (sma20.iloc[-1] - sma200.iloc[-1]) / sma200.iloc[-1] * 100
+            if ma_spread > 0.5:  # Strong bullish if spread > 0.5%
+                return 'STRONG_BULLISH'
+            else:
+                return 'BULLISH'
+
+        elif bearish_structure:
+            # Check if MAs are spreading apart (strong trend)
+            ma_spread = (sma200.iloc[-1] - sma20.iloc[-1]) / sma200.iloc[-1] * 100
+            if ma_spread > 0.5:  # Strong bearish if spread > 0.5%
+                return 'STRONG_BEARISH'
+            else:
+                return 'BEARISH'
+        else:
+            return 'NEUTRAL'
+
+    except Exception as e:
+        if DEBUG:
+            print(f"Error calculating market structure: {e}")
+        return 'NEUTRAL'
+
 def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='live', trade_recorder=None):
     """Process a single symbol for live trading - UNIFIED LOGIC"""
     symbol, index = next(iter(symbol_dict.items()))
@@ -578,7 +664,7 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
 
     # Get current values
     current_signal = predictions.iloc[-1]
-    current_time = df.index[-1]
+    current_time = df.index[-1].strftime('%Y-%m-%d %H:%M:%S') if hasattr(df.index[-1], 'strftime') else str(df.index[-1])
     current_price = df['close'].iloc[-1]
 
     # Get kernel signals
@@ -652,16 +738,27 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
         signal_state.increment_bars_held(index)
         bars_held = signal_state.get_bars_held(index)
 
-        # Exit conditions:
-        # 1. Held for exactly 4 bars (strict exit)
-        # 2. New opposite signal appears before 4 bars
-        # 3. Dynamic exit (if enabled)
+        # Get entry price
+        entry_info = signal_state.get_entry_info(index)
+        entry_price = entry_info.get('price', current_price)
 
+        # Calculate profit percentage
+        profit_pct = ((current_price - entry_price) / entry_price) * 100
+
+        # Exit conditions:
+        # 1. Hit 0.1% profit target
+        # 2. Hit 0.05% stop loss (NEW!)
+        # 3. Held for exactly 4 bars (strict exit)
+        # 4. New opposite signal appears before 4 bars
+        # 5. Dynamic exit (if enabled)
+
+        profit_target_hit = profit_pct >= 0.1  # 0.1% profit target
+        # stop_loss_hit = profit_pct <= -0.1  # 0.05% stop loss - TIGHT!
         strict_exit = bars_held >= STRICT_EXIT_BARS
         opposite_signal = persisted_signal == -1 and current_bearish and short_filters
         dynamic_exit = check_dynamic_exit_conditions(df, 'LONG', bars_held) if USE_DYNAMIC_EXITS else False
 
-        if strict_exit or opposite_signal or dynamic_exit:
+        if profit_target_hit or strict_exit or opposite_signal or dynamic_exit:
             action_taken = "SELL"
             signal_state.update_position(index, None)
             signal_state.reset_bars_held(index)
@@ -669,6 +766,15 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
     elif current_position == 'SHORT':
         signal_state.increment_bars_held(index)
         bars_held = signal_state.get_bars_held(index)
+
+        # Get entry price
+        entry_info = signal_state.get_entry_info(index)
+        entry_price = entry_info.get('price', current_price)
+
+        # Calculate profit percentage (for SHORT, profit is when price goes DOWN)
+        profit_pct = ((entry_price - current_price) / entry_price) * 100
+
+        # Exit conditions with profit target and stop loss
 
         strict_exit = bars_held >= STRICT_EXIT_BARS
         opposite_signal = persisted_signal == 1 and current_bullish and long_filters
@@ -681,16 +787,42 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
 
     # Entry logic - MORE LIKE PINE SCRIPT
     if current_position is None:
-        # Check for entry signals (don't require is_new_signal!)
-        if persisted_signal == 1 and current_bullish and long_filters:
+
+        # ADD THIS: Check market structure first
+        market_structure = calculate_market_structure(df)
+
+        # Check entry quality first!
+        long_quality = calculate_entry_quality(df, 'LONG')
+        short_quality = calculate_entry_quality(df, 'SHORT')
+
+        # ADD THIS: Market structure alignment check
+        can_go_long = market_structure in ['BULLISH', 'STRONG_BULLISH']
+        can_go_short = market_structure in ['BEARISH', 'STRONG_BEARISH']
+
+        if persisted_signal == 1 and current_bullish and long_filters and long_quality and can_go_long:
             action_taken = "BUY"
             signal_state.update_position(index, 'LONG', float(current_price), current_time)
             signal_state.reset_bars_held(index)
 
-        elif persisted_signal == -1 and current_bearish and short_filters:
+            # Log market structure
+            if DEBUG:
+                print(f"  Entering LONG in {market_structure} market")
+
+        elif persisted_signal == -1 and current_bearish and short_filters and short_quality and can_go_short:
             action_taken = "SHORT"
             signal_state.update_position(index, 'SHORT', float(current_price), current_time)
             signal_state.reset_bars_held(index)
+
+            # Log market structure
+            if DEBUG:
+                print(f"  Entering SHORT in {market_structure} market")
+
+            # ADD THIS: Debug why trades are skipped
+        elif DEBUG and (persisted_signal != 0):
+            if persisted_signal == 1 and not can_go_long:
+                print(f"  LONG signal rejected - Market structure: {market_structure}")
+            elif persisted_signal == -1 and not can_go_short:
+                print(f"  SHORT signal rejected - Market structure: {market_structure}")
 
     # Update signal state with PERSISTED signal
     signal_state.update_signal(index, int(persisted_signal) if hasattr(persisted_signal, 'item') else persisted_signal)
@@ -777,11 +909,11 @@ def run_backtest_analysis():
     print("=" * 80 + "\n")
 
     indices = [
-        # {"13": "NIFTY"},
+        {"13": "NIFTY"},
         {"25": "BANKNIFTY"},
-        # {"51": "SENSEX"},
-        # {"27": "FINNIFTY"},
-        # {"442": "MIDCPNIFTY"}
+        {"51": "SENSEX"},
+        {"27": "FINNIFTY"},
+        {"442": "MIDCPNIFTY"}
     ]
 
     # Use separate state file for backtest
@@ -790,8 +922,8 @@ def run_backtest_analysis():
     # Initialize trade recorders for each index
     trade_recorders = {}
 
-    replace_csv_content('testing_data/backup_input.csv', 'testing_data/BANKNIFTY_input.csv')
-    replace_csv_content('testing_data/backup_test.csv', 'testing_data/BANKNIFTY_test.csv')
+    # replace_csv_content('testing_data/backup_input.csv', 'testing_data/NIFTY_input.csv')
+    # replace_csv_content('testing_data/backup_test.csv', 'testing_data/NIFTY_test.csv')
 
     # Initialize trade recorder if not exists
     for index_dict in indices:
