@@ -18,6 +18,9 @@ from strategy_features import compute_feature, rational_quadratic_kernel, gaussi
 import dhanhq
 from trade_placement import KotakOptionsTrader
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+
 # === CONFIG ===
 # Feature configuration - EXACT match to Pine Script
 FEATURE_CONFIG = [
@@ -69,6 +72,13 @@ USE_DYNAMIC_EXITS = True  # Pine default is False
 # Signal persistence file
 SIGNAL_STATE_FILE = "signal_state.json"
 DEBUG = True
+
+CANDLE_INTERVAL_MINUTES = 15  # Change this to modify candle interval globally
+CANDLE_COMPLETION_BUFFER = 5  # Seconds to wait after candle closes
+
+# Add realistic execution price (slight slippage)
+BACKTEST_SLIPPAGE = 0.02  # 0.02% slippage
+
 
 
 class SignalState:
@@ -147,8 +157,14 @@ class TradeRecorder:
         self.entry_time = None
 
     def record_trade(self, timestamp, index_name, signal_type, price):
+        # Ensure timestamp is a string
+        if isinstance(timestamp, pd.Timestamp):
+            timestamp_str = timestamp.strftime('%Y-%m-%d %H:%M:%S')
+        else:
+            timestamp_str = str(timestamp)
+
         self.trades.append({
-            'timestamp': timestamp,
+            'timestamp': timestamp_str,
             'index': index_name,
             'action': signal_type,
             'price': price
@@ -158,14 +174,14 @@ class TradeRecorder:
         if signal_type in ['BUY', 'SHORT']:
             self.current_position = signal_type
             self.entry_price = price
-            self.entry_time = timestamp
+            self.entry_time = timestamp_str  # Use string version
         elif signal_type in ['SELL', 'COVER']:
             if self.current_position:
                 profit = price - self.entry_price if self.current_position == 'BUY' else self.entry_price - price
                 self.positions.append({
                     'index': index_name,
-                    'entry_time': self.entry_time,
-                    'exit_time': timestamp,
+                    'entry_time': self.entry_time,  # Already a string
+                    'exit_time': timestamp_str,  # Use string version
                     'entry_price': self.entry_price,
                     'exit_price': price,
                     'type': self.current_position,
@@ -173,6 +189,7 @@ class TradeRecorder:
                     'profit_pct': (profit / self.entry_price) * 100
                 })
             self.current_position = None
+
 
 def replace_csv_content(source_filename, dest_filename):
     if not os.path.exists(source_filename):
@@ -183,6 +200,7 @@ def replace_csv_content(source_filename, dest_filename):
 
     shutil.copyfile(source_filename, dest_filename)
     return True
+
 
 # === Feature Calculation ===
 def build_features(df):
@@ -200,32 +218,97 @@ def build_features(df):
         features.append(f)
     return pd.concat(features, axis=1).dropna()
 
-def save_historical_data(symbols_dict, months=10):
-    """Fetch and save 10 months of data locally"""
+
+def save_historical_data(symbols_dict, start_date=None, end_date=None, months=10):
+    """
+    Fetch and save historical data locally
+
+    Args:
+        symbols_dict: Dictionary of symbol:index pairs
+        start_date: Start date string (YYYY-MM-DD). If provided, ignores months param
+        end_date: End date string (YYYY-MM-DD). If provided, ignores months param
+        months: Number of months to fetch (used only if start_date/end_date not provided)
+    """
     data_dir = "historical_data"
     os.makedirs(data_dir, exist_ok=True)
 
-    for symbol, index in symbols_dict.items():
-        print(f"Fetching {months} months data for {index}...")
-        df = fetch_ohlc(symbol, interval=15, months=months)
+    # Determine date range
+    if start_date and end_date:
+        start = pd.to_datetime(start_date)
+        end = pd.to_datetime(end_date)
+        date_suffix = f"{start.strftime('%Y%m%d')}_{end.strftime('%Y%m%d')}"
+        print(f"Fetching data from {start_date} to {end_date}")
+    else:
+        end = datetime.now()
+        start = end - timedelta(days=30 * months)
+        date_suffix = f"{months}months"
+        print(f"Fetching last {months} months of data")
 
-        # Save as pickle for faster loading
-        filename = f"{data_dir}/{index}_{months}months.pkl"
+    for symbol, index in symbols_dict.items():
+        print(f"Fetching data for {index}...")
+
+        # Fetch data in chunks
+        chunks = []
+        current_start = start
+
+        while current_start <= end:
+            current_end = min(current_start + timedelta(days=75), end)
+
+            try:
+                r = dhan_object.intraday_minute_data(
+                    security_id=symbol,
+                    from_date=current_start.strftime('%Y-%m-%d'),
+                    to_date=current_end.strftime('%Y-%m-%d'),
+                    interval=CANDLE_INTERVAL_MINUTES,
+                    exchange_segment="IDX_I",
+                    instrument_type="INDEX"
+                )
+                data = r.get('data', [])
+                if data:
+                    chunks.append(pd.DataFrame(data))
+            except Exception as e:
+                print(f"  Error fetching {index} for {current_start.strftime('%Y-%m-%d')}: {e}")
+
+            current_start = current_end + timedelta(days=1)
+
+        if not chunks:
+            print(f"  No data fetched for {index}")
+            continue
+
+        # Combine chunks
+        df = pd.concat(chunks).reset_index(drop=True)
+        df['datetime'] = pd.to_datetime(df['timestamp'], unit='s')
+        df['datetime'] = df['datetime'].dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata').dt.tz_localize(None)
+        df.set_index('datetime', inplace=True)
+        df = df[['open', 'high', 'low', 'close']].astype(float)
+        df = df.sort_index()
+
+        # Save with date suffix
+        filename = f"{data_dir}/{index}_{date_suffix}.pkl"
         df.to_pickle(filename)
-        print(f"Saved {len(df)} rows to {filename}")
+        print(f"  Saved {len(df)} rows to {filename}")
 
         # Also save as CSV for inspection
-        df.to_csv(f"{data_dir}/{index}_{months}months.csv")
+        csv_filename = f"{data_dir}/{index}_{date_suffix}.csv"
+        df.to_csv(csv_filename)
+        print(f"  Also saved as {csv_filename}")
 
 
 def load_historical_data(index, filename=None):
-    """Load saved historical data"""
-
+    """Load saved historical data with proper datetime parsing"""
     if filename is None:
         filename = f"historical_data/{index}_10months.pkl"
 
     if os.path.exists(filename):
-        return pd.read_csv(filename)
+        # Load CSV with datetime parsing - 'datetime' is the column name
+        df = pd.read_csv(filename, parse_dates=['datetime'], index_col='datetime')
+
+        # Ensure columns are float
+        for col in ['open', 'high', 'low', 'close']:
+            if col in df.columns:
+                df[col] = df[col].astype(float)
+
+        return df
     else:
         raise FileNotFoundError(f"Please run save_historical_data first. {filename} not found.")
 
@@ -298,6 +381,67 @@ def calculate_adx(df, period=14):
     adx = rma(dx, period)
 
     return adx
+
+
+def check_early_exit_signals(df, position, bars_held, entry_price):
+    """Detect early signs that a trade is going wrong"""
+    if bars_held == 0 or len(df) < 5:
+        return False
+
+    current_price = df['close'].iloc[-1]
+    current_profit_pct = ((current_price - entry_price) / entry_price * 100) if position == 'LONG' else (
+            (entry_price - current_price) / entry_price * 100)
+
+    # Early exit conditions (without using stop loss)
+    early_exit_conditions = []
+
+    # 1. Momentum reversal in first 2 bars
+    if bars_held <= 2:
+        # Check if price is moving against us quickly
+        if position == 'LONG':
+            # Price made lower low than entry bar
+            going_wrong = df['low'].iloc[-1] < df['low'].iloc[-bars_held - 1]
+            momentum_against = df['close'].iloc[-1] < df['open'].iloc[-1]  # Red candle
+        else:  # SHORT
+            # Price made higher high than entry bar
+            going_wrong = df['high'].iloc[-1] > df['high'].iloc[-bars_held - 1]
+            momentum_against = df['close'].iloc[-1] > df['open'].iloc[-1]  # Green candle
+
+        if going_wrong and momentum_against and current_profit_pct < 0:
+            early_exit_conditions.append("early_momentum_reversal")
+
+    # 2. Failed breakout pattern (price rejection)
+    if 1 <= bars_held <= 3:
+        # Check for price rejection patterns
+        current_range = (df['high'].iloc[-1] - df['low'].iloc[-1]) / df['low'].iloc[-1] * 100
+
+        if position == 'LONG':
+            # Long wick on top (rejection at highs)
+            wick_ratio = (df['high'].iloc[-1] - df['close'].iloc[-1]) / (df['high'].iloc[-1] - df['low'].iloc[-1])
+            rejected = wick_ratio > 0.6 and current_range > 0.2
+        else:  # SHORT
+            # Long wick on bottom (rejection at lows)
+            wick_ratio = (df['close'].iloc[-1] - df['low'].iloc[-1]) / (df['high'].iloc[-1] - df['low'].iloc[-1])
+            rejected = wick_ratio > 0.6 and current_range > 0.2
+
+        if rejected and current_profit_pct < -0.05:
+            early_exit_conditions.append("price_rejection")
+
+    # 3. Accelerating adverse movement
+    if bars_held >= 2:
+        # Check if losses are accelerating
+        prev_close = df['close'].iloc[-2]
+        prev_profit_pct = ((prev_close - entry_price) / entry_price * 100) if position == 'LONG' else (
+                (entry_price - prev_close) / entry_price * 100)
+
+        # If loss is getting worse each bar
+        if current_profit_pct < -0.1 and current_profit_pct < prev_profit_pct:
+            early_exit_conditions.append("accelerating_loss")
+
+    if early_exit_conditions and DEBUG:
+        print(f"  ⚠️ Early exit signals: {', '.join(early_exit_conditions)}")
+
+    return len(early_exit_conditions) > 0
 
 
 @jit(nopython=True)
@@ -625,6 +769,7 @@ def calculate_market_structure(df):
             print(f"Error calculating market structure: {e}")
         return 'NEUTRAL'
 
+
 def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='live', trade_recorder=None):
     """Process a single symbol for live trading - UNIFIED LOGIC"""
     symbol, index = next(iter(symbol_dict.items()))
@@ -632,14 +777,14 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
     # Fetch data based on mode
     if mode == 'live':
         # Fetch OHLC data from API
-        df = fetch_ohlc(symbol, interval=interval_time)
+        df = fetch_ohlc(symbol)
 
-        if quote_data and 'last_price' in quote_data:
-            now = pd.Timestamp.now().floor("25min")
-            if now not in df.index or (datetime.now() - df.index[-1].to_pydatetime()).total_seconds() > 25 * 60:
-                ltp = float(quote_data['last_price'])
-                df.loc[now] = [ltp, ltp, ltp, ltp]
-                print(f"📊 Added live candle for {index} at {ltp}")
+        # if quote_data and 'last_price' in quote_data:
+        #     now = pd.Timestamp.now().floor("15min")
+        #     if now not in df.index or (datetime.now() - df.index[-1].to_pydatetime()).total_seconds() > 25 * 60:
+        #         ltp = float(quote_data['last_price'])
+        #         df.loc[now] = [ltp, ltp, ltp, ltp]
+        #         print(f"📊 Added live candle for {index} at {ltp}")
 
     else:
         # Load data from test.csv for backtest
@@ -664,7 +809,14 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
 
     # Get current values
     current_signal = predictions.iloc[-1]
-    current_time = df.index[-1].strftime('%Y-%m-%d %H:%M:%S') if hasattr(df.index[-1], 'strftime') else str(df.index[-1])
+    # Fix: Ensure we get the actual datetime, not row number
+    if isinstance(df.index[-1], pd.Timestamp):
+        current_time = df.index[-1].strftime('%Y-%m-%d %H:%M:%S')
+    else:
+        # Fallback if index isn't datetime
+        current_time = str(df.index[-1])
+        if DEBUG:
+            print(f"⚠️ Warning: Index is not datetime type for {index}")
     current_price = df['close'].iloc[-1]
 
     # Get kernel signals
@@ -753,6 +905,7 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
         # 5. Dynamic exit (if enabled)
 
         profit_target_hit = profit_pct >= 0.1  # 0.1% profit target
+        # early_exit_signal = check_early_exit_signals(df, 'LONG', bars_held, entry_price)
         # stop_loss_hit = profit_pct <= -0.1  # 0.05% stop loss - TIGHT!
         strict_exit = bars_held >= STRICT_EXIT_BARS
         opposite_signal = persisted_signal == -1 and current_bearish and short_filters
@@ -776,17 +929,28 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
 
         # Exit conditions with profit target and stop loss
 
+        profit_target_hit = profit_pct >= 0.1  # 0.1% profit target
+        # early_exit_signal = check_early_exit_signals(df, 'SHORT', bars_held, entry_price)
         strict_exit = bars_held >= STRICT_EXIT_BARS
         opposite_signal = persisted_signal == 1 and current_bullish and long_filters
         dynamic_exit = check_dynamic_exit_conditions(df, 'SHORT', bars_held) if USE_DYNAMIC_EXITS else False
 
-        if strict_exit or opposite_signal or dynamic_exit:
+        if strict_exit or opposite_signal or dynamic_exit or profit_target_hit:
             action_taken = "COVER"
             signal_state.update_position(index, None)
             signal_state.reset_bars_held(index)
 
     # Entry logic - MORE LIKE PINE SCRIPT
     if current_position is None:
+
+        # NEW: Check if we should skip this candle for entries
+        if should_skip_candle_for_entry(df.index[-1]):
+            if DEBUG:
+                print(f"  ⏭️ Skipping entry signals for {index} at {current_time} (first/last candle)")
+            # Still update the signal state but don't take action
+            signal_state.update_signal(index,
+                                       int(persisted_signal) if hasattr(persisted_signal, 'item') else persisted_signal)
+            return
 
         # ADD THIS: Check market structure first
         market_structure = calculate_market_structure(df)
@@ -857,15 +1021,20 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
             trader.execute_single_trade(timestamp=current_time, index_name=index, signal_type=action_taken)
 
         elif mode == 'backtest' and trade_recorder:
+
+            if action_taken in ['BUY', 'SHORT']:
+                execution_price = current_price * (1 + BACKTEST_SLIPPAGE / 100)
+            else:  # SELL, COVER
+                execution_price = current_price * (1 - BACKTEST_SLIPPAGE / 100)
             # Record trade for backtest
-            trade_recorder.record_trade(current_time, index, action_taken, current_price)
+            trade_recorder.record_trade(current_time, index, action_taken, execution_price)
     else:
         if DEBUG and mode == 'live':  # Only log in live mode to reduce noise
             print(f"📊 {index}: {log_str}")
 
 
 # === Data Fetching ===
-def fetch_ohlc(symbol, interval=25, months=5):
+def fetch_ohlc(symbol, interval=CANDLE_INTERVAL_MINUTES, months=10):
     """Fetch OHLC data from Dhan"""
     end = datetime.now()
     start = end - timedelta(days=30 * months)
@@ -901,11 +1070,50 @@ def fetch_ohlc(symbol, interval=25, months=5):
     return df.sort_index()
 
 
-# === Backtest Analysis ===
+def process_index_backtest(index_dict, backtest_state_lock):
+    """Process backtest for a single index in parallel"""
+    symbol, index = next(iter(index_dict.items()))
+
+    # Create index-specific state file to avoid conflicts
+    index_state = SignalState(filepath=f"backtest_signal_state_{index}.json")
+    trade_recorder = TradeRecorder()
+
+    print(f"\n🔄 Starting backtest for {index}...")
+
+    trade_count = 0
+    while move_first_row(f'testing_data/{index}_input.csv', f'testing_data/{index}_test.csv'):
+        try:
+            # Process using the SAME function as live mode
+            process_symbol(
+                symbol_dict=index_dict,
+                signal_state=index_state,
+                trader=None,
+                quote_data=None,
+                mode='backtest',
+                trade_recorder=trade_recorder
+            )
+            trade_count += 1
+
+            # Progress update every 100 trades
+            if trade_count % 100 == 0:
+                print(f"  {index}: Processed {trade_count} candles...")
+
+        except Exception as e:
+            print(f"  ❌ Error processing {index}: {str(e)}")
+
+    print(f"✅ Completed {index} backtest: {trade_count} candles processed")
+
+    # Clean up index-specific state file
+    if os.path.exists(f"backtest_signal_state_{index}.json"):
+        os.remove(f"backtest_signal_state_{index}.json")
+
+    return index, trade_recorder
+
+
 def run_backtest_analysis():
-    """Run comprehensive backtest using the same logic as live mode"""
+    """Run comprehensive backtest using parallel processing"""
     print("\n" + "=" * 80)
-    print("RUNNING BACKTEST ANALYSIS (UNIFIED LOGIC)")
+    print("RUNNING PARALLEL BACKTEST ANALYSIS")
     print("=" * 80 + "\n")
 
     indices = [
@@ -916,76 +1124,64 @@ def run_backtest_analysis():
         {"442": "MIDCPNIFTY"}
     ]
 
-    # Use separate state file for backtest
-    backtest_state = SignalState(filepath="backtest_signal_state.json")
+    # Thread lock for shared resources
+    backtest_state_lock = threading.Lock()
 
-    # Initialize trade recorders for each index
+    # Run backtests in parallel
     trade_recorders = {}
 
-    # replace_csv_content('testing_data/backup_input.csv', 'testing_data/NIFTY_input.csv')
-    # replace_csv_content('testing_data/backup_test.csv', 'testing_data/NIFTY_test.csv')
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        # Submit all tasks
+        future_to_index = {
+            executor.submit(process_index_backtest, index_dict, backtest_state_lock): index_dict
+            for index_dict in indices
+        }
 
-    # Initialize trade recorder if not exists
-    for index_dict in indices:
-        symbol, index = next(iter(index_dict.items()))
-
-        if index not in trade_recorders:
-            trade_recorders[index] = TradeRecorder()
-
-        while move_first_row(f'testing_data/{index}_input.csv', f"testing_data/{index}_test.csv"):
-
+        # Collect results as they complete
+        for future in as_completed(future_to_index):
+            index_dict = future_to_index[future]
             try:
-                # Process using the SAME function as live mode
-                process_symbol(
-                    symbol_dict=index_dict,
-                    signal_state=backtest_state,
-                    trader=None,  # No trader in backtest
-                    quote_data=None,
-                    mode='backtest',
-                    trade_recorder=trade_recorders[index]
-                )
-            except Exception as e:
-                print(f"  Error processing {index}: {str(e)}")
+                index_name, recorder = future.result()
+                trade_recorders[index_name] = recorder
+            except Exception as exc:
+                symbol, index_name = next(iter(index_dict.items()))
+                print(f"❌ {index_name} generated an exception: {exc}")
 
-        # Analyze results
-        print("\n" + "=" * 80)
-        print("BACKTEST RESULTS")
-        print("=" * 80)
+    # Analyze results
+    print("\n" + "=" * 80)
+    print("BACKTEST RESULTS")
+    print("=" * 80)
 
-        all_results = {}
-        for index, recorder in trade_recorders.items():
-            if recorder.positions:
-                total_trades = len(recorder.positions)
-                winning_trades = sum(1 for p in recorder.positions if p['profit'] > 0)
-                total_profit = sum(p['profit'] for p in recorder.positions)
-                win_rate = (winning_trades / total_trades) * 100 if total_trades > 0 else 0
+    all_results = {}
+    for index, recorder in trade_recorders.items():
+        if recorder.positions:
+            total_trades = len(recorder.positions)
+            winning_trades = sum(1 for p in recorder.positions if p['profit'] > 0)
+            total_profit = sum(p['profit'] for p in recorder.positions)
+            win_rate = (winning_trades / total_trades) * 100 if total_trades > 0 else 0
 
-                all_results[index] = {
-                    'trades': recorder.trades,
-                    'positions': recorder.positions,
-                    'performance': {
-                        'total_trades': total_trades,
-                        'winning_trades': winning_trades,
-                        'losing_trades': total_trades - winning_trades,
-                        'win_rate': win_rate,
-                        'total_profit': total_profit,
-                        'avg_profit': total_profit / total_trades if total_trades > 0 else 0,
-                        'avg_profit_pct': sum(
-                            p['profit_pct'] for p in recorder.positions) / total_trades if total_trades > 0 else 0
-                    }
+            all_results[index] = {
+                'trades': recorder.trades,
+                'positions': recorder.positions,
+                'performance': {
+                    'total_trades': total_trades,
+                    'winning_trades': winning_trades,
+                    'losing_trades': total_trades - winning_trades,
+                    'win_rate': win_rate,
+                    'total_profit': total_profit,
+                    'avg_profit': total_profit / total_trades if total_trades > 0 else 0,
+                    'avg_profit_pct': sum(
+                        p['profit_pct'] for p in recorder.positions) / total_trades if total_trades > 0 else 0
                 }
+            }
 
-                print(f"\n{index} Performance:")
-                print(f"  Total Trades: {total_trades}")
-                print(f"  Win Rate: {win_rate:.2f}%")
-                print(f"  Total Profit: {total_profit:.2f}")
+            print(f"\n{index} Performance:")
+            print(f"  Total Trades: {total_trades}")
+            print(f"  Win Rate: {win_rate:.2f}%")
+            print(f"  Total Profit: {total_profit:.2f}")
 
-        # Save results
-        save_backtest_results(all_results)
-
-        # Clean up backtest state file
-        if os.path.exists("backtest_signal_state.json"):
-            os.remove("backtest_signal_state.json")
+    # Save results
+    save_backtest_results(all_results)
 
     return all_results
 
@@ -1118,7 +1314,7 @@ def run_live_trading(signal_state, trader):
         print("Exiting as market won't open today.")
         return
 
-    print("✅ Live trading started. Will run every 25 minutes until 3:30 PM IST.")
+    print(f"✅ Live trading started. Will run every {CANDLE_INTERVAL_MINUTES} minutes until 3:30 PM IST.")
 
     # Wait for current candle to complete if starting mid-candle
     next_run = get_next_candle_time()
@@ -1147,22 +1343,22 @@ def run_live_trading(signal_state, trader):
         print(f"🕒 Running strategy at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'=' * 60}\n")
 
-        # Fetch all quotes at once
-        all_symbols = [int(list(idx.keys())[0]) for idx in indices]
-        try:
-            quote_response = dhan_object.quote_data({"IDX_I": all_symbols})
-            quotes = {}
-            if 'data' in quote_response and 'data' in quote_response['data'] and 'IDX_I' in quote_response['data'][
-                'data']:
-                quotes = quote_response['data']['data']['IDX_I']
-        except Exception as e:
-            print(f"Error fetching quotes: {e}")
-            quotes = {}
+        # # Fetch all quotes at once
+        # all_symbols = [int(list(idx.keys())[0]) for idx in indices]
+        # try:
+        #     quote_response = dhan_object.quote_data({"IDX_I": all_symbols})
+        #     quotes = {}
+        #     if 'data' in quote_response and 'data' in quote_response['data'] and 'IDX_I' in quote_response['data'][
+        #         'data']:
+        #         quotes = quote_response['data']['data']['IDX_I']
+        # except Exception as e:
+        #     print(f"Error fetching quotes: {e}")
+        #     quotes = {}
 
         for index_dict in indices:
             try:
-                symbol, index = next(iter(index_dict.items()))
-                process_symbol(index_dict, signal_state, trader, quotes.get(symbol), mode='live')
+                # symbol, index = next(iter(index_dict.items()))
+                process_symbol(index_dict, signal_state, trader, quote_data=None, mode='live')
             except Exception as e:
                 symbol, index = next(iter(index_dict.items()))
                 print(f"❌ Error processing {index}: {str(e)}")
@@ -1173,9 +1369,30 @@ def run_live_trading(signal_state, trader):
         sleep_duration = (next_run - datetime.now()).total_seconds()
 
         if sleep_duration > 0:
-            print(
-                f"\n🕒 Next run at {next_run.strftime('%H:%M:%S')} (candle close + 30s). Sleeping for {int(sleep_duration)} seconds...\n")
+            print(f"\n🕒 Next run at {next_run.strftime('%H:%M:%S')} (candle close + {CANDLE_COMPLETION_BUFFER}s). "
+                  f"Sleeping for {int(sleep_duration)} seconds...\n")
             time.sleep(sleep_duration)
+
+
+def should_skip_candle_for_entry(timestamp):
+    """Skip entry signals on first and last candles of the day"""
+    if hasattr(timestamp, 'time'):
+        candle_time = timestamp.time()
+    else:
+        candle_time = pd.Timestamp(timestamp).time()
+
+    hour = candle_time.hour
+    minute = candle_time.minute
+
+    # Skip 9:15 candle (market open)
+    if hour == 9 and minute == 15:
+        return True
+
+    # Skip 3:15 candle (near market close)
+    if hour == 15 and minute == 15:
+        return True
+
+    return False
 
 
 def get_next_candle_time():
@@ -1187,19 +1404,19 @@ def get_next_candle_time():
 
     # If before market open, return first candle close
     if now < market_open:
-        return market_open + timedelta(minutes=25)
+        return market_open + timedelta(minutes=CANDLE_INTERVAL_MINUTES)
 
     # Calculate minutes since market open
     minutes_since_open = (now - market_open).total_seconds() / 60
 
     # Calculate which candle we're in
-    candles_passed = int(minutes_since_open // 25)
+    candles_passed = int(minutes_since_open // CANDLE_INTERVAL_MINUTES)
 
     # Next candle close time
-    next_candle_close = market_open + timedelta(minutes=(candles_passed + 1) * 25)
+    next_candle_close = market_open + timedelta(minutes=(candles_passed + 1) * CANDLE_INTERVAL_MINUTES)
 
     # Add 30 seconds buffer to ensure candle is fully closed
-    return next_candle_close + timedelta(seconds=30)
+    return next_candle_close + timedelta(seconds=CANDLE_COMPLETION_BUFFER)
 
 
 # === Main Entry Point ===
@@ -1210,8 +1427,6 @@ if __name__ == '__main__':
     CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
     ACCESS_TOKEN = os.getenv("DHAN_API_KEY")
     KOTAK_ACCESS_TOKEN = os.getenv("KOTAK_ACCESS_TOKEN")
-
-    interval_time = 25
 
     # Initialize Dhan
     dhan_object = dhanhq.dhanhq(CLIENT_ID, ACCESS_TOKEN)
