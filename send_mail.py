@@ -11,13 +11,16 @@ from dotenv import load_dotenv
 load_dotenv()
 EMAIL = os.getenv("SENDER_EMAIL")
 PASSWORD = os.getenv("MAIL_PASSWORD")
-RECIPIENT = os.getenv("RECEIVER_MAIL")
+RECIPIENT1 = os.getenv("RECEIVER_MAIL1")
+RECIPIENT2 = os.getenv("RECEIVER_MAIL2")
+
+RECIPIENTS = [RECIPIENT1, RECIPIENT2]
 
 def send_email(subject, body):
     msg = MIMEText(body)
     msg["Subject"] = subject
     msg["From"] = EMAIL
-    msg["To"] = RECIPIENT
+    msg["To"] = ", ".join(RECIPIENTS)
 
     msg["X-Priority"] = "1"
     msg["Importance"] = "High"
@@ -26,4 +29,4 @@ def send_email(subject, body):
     with smtplib.SMTP("smtp.gmail.com", 587) as server:
         server.starttls()
         server.login(EMAIL, PASSWORD)
-        server.sendmail(EMAIL, RECIPIENT, msg.as_string())
+        server.sendmail(EMAIL, RECIPIENTS, msg.as_string())

@@ -1132,7 +1132,7 @@ class KotakOptionsTrader:
             order_params = {
                 "trading_symbol": trading_symbol,
                 "exchange_segment": exchange_segment,
-                "product": "NRML",
+                "product": "MIS",
                 "price": str(price) if price else "0",
                 "order_type": order_type,
                 "quantity": str(quantity),

@@ -904,6 +904,15 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
         # 4. New opposite signal appears before 4 bars
         # 5. Dynamic exit (if enabled)
 
+        force_exit_at_315 = False
+        if hasattr(df.index[-1], 'time'):
+            current_candle_time = df.index[-1].time()
+            # Exit at 3:15 PM or later
+            if current_candle_time >= pd.Timestamp("15:15:00").time():
+                force_exit_at_315 = True
+                if DEBUG:
+                    print(f"  🕐 Forcing exit at 3:15 PM for intraday square-off")
+
         profit_target_hit = profit_pct >= 0.1  # 0.1% profit target
         # early_exit_signal = check_early_exit_signals(df, 'LONG', bars_held, entry_price)
         # stop_loss_hit = profit_pct <= -0.1  # 0.05% stop loss - TIGHT!
@@ -911,7 +920,7 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
         opposite_signal = persisted_signal == -1 and current_bearish and short_filters
         dynamic_exit = check_dynamic_exit_conditions(df, 'LONG', bars_held) if USE_DYNAMIC_EXITS else False
 
-        if profit_target_hit or strict_exit or opposite_signal or dynamic_exit:
+        if force_exit_at_315 or profit_target_hit or strict_exit or opposite_signal or dynamic_exit:
             action_taken = "SELL"
             signal_state.update_position(index, None)
             signal_state.reset_bars_held(index)
@@ -927,15 +936,23 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
         # Calculate profit percentage (for SHORT, profit is when price goes DOWN)
         profit_pct = ((entry_price - current_price) / entry_price) * 100
 
-        # Exit conditions with profit target and stop loss
+        force_exit_at_315 = False
+        if hasattr(df.index[-1], 'time'):
+            current_candle_time = df.index[-1].time()
+            # Exit at 3:15 PM or later
+            if current_candle_time >= pd.Timestamp("15:15:00").time():
+                force_exit_at_315 = True
+                if DEBUG:
+                    print(f"  🕐 Forcing exit at 3:15 PM for intraday square-off")
 
+        # Exit conditions with profit target and stop loss
         profit_target_hit = profit_pct >= 0.1  # 0.1% profit target
         # early_exit_signal = check_early_exit_signals(df, 'SHORT', bars_held, entry_price)
         strict_exit = bars_held >= STRICT_EXIT_BARS
         opposite_signal = persisted_signal == 1 and current_bullish and long_filters
         dynamic_exit = check_dynamic_exit_conditions(df, 'SHORT', bars_held) if USE_DYNAMIC_EXITS else False
 
-        if strict_exit or opposite_signal or dynamic_exit or profit_target_hit:
+        if force_exit_at_315 or strict_exit or opposite_signal or dynamic_exit or profit_target_hit:
             action_taken = "COVER"
             signal_state.update_position(index, None)
             signal_state.reset_bars_held(index)
@@ -1460,7 +1477,31 @@ if __name__ == '__main__':
         elif sys.argv[1] == 'save_data':
             print("Saving historical data...")
             indices = {"13": "NIFTY", "25": "BANKNIFTY", "51": "SENSEX", "27": "FINNIFTY", "442": "MIDCPNIFTY"}
-            save_historical_data(indices, months=20)
+
+            # 1. COVID Crash Period (Jan 2019 - Aug 2020)
+            # save_historical_data(indices, start_date="2019-01-01", end_date="2020-08-31")
+            #
+            # # 2. Post-COVID Bull Run (Aug 2020 - Mar 2022)
+            # save_historical_data(indices, start_date="2020-08-01", end_date="2022-03-31")
+            #
+            # # 3. 2022 Bear Market (Jun 2021 - Jan 2023)
+            # save_historical_data(indices, start_date="2021-06-01", end_date="2023-01-31")
+            #
+            # # 4. Volatile Recovery (Apr 2022 - Nov 2023)
+            # save_historical_data(indices, start_date="2022-04-01", end_date="2023-11-30")
+            #
+            # # 5. Recent Bull Market (Feb 2023 - Sep 2024)
+            # save_historical_data(indices, start_date="2023-02-01", end_date="2024-09-30")
+            #
+            # # 6. Mixed Market Conditions (Oct 2018 - May 2020)
+            # save_historical_data(indices, start_date="2018-10-01", end_date="2020-05-31")
+
+            # Default - Now - 20 months
+            # save_historical_data(indices, months=20)
+
+            # Default - Now - 60 months
+            save_historical_data(indices, months=60)
+
     else:
         # Run live trading mode (REAL TRADES)
         print("Running in LIVE TRADING mode...")
