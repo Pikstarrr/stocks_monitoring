@@ -770,7 +770,7 @@ def calculate_market_structure(df):
         return 'NEUTRAL'
 
 
-def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='live', trade_recorder=None):
+def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='live', trade_recorder=None, window_df=None, precalc_data=None):
     """Process a single symbol for live trading - UNIFIED LOGIC"""
     symbol, index = next(iter(symbol_dict.items()))
 
@@ -778,63 +778,58 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
     if mode == 'live':
         # Fetch OHLC data from API
         df = fetch_ohlc(symbol)
-
-        # if quote_data and 'last_price' in quote_data:
-        #     now = pd.Timestamp.now().floor("15min")
-        #     if now not in df.index or (datetime.now() - df.index[-1].to_pydatetime()).total_seconds() > 25 * 60:
-        #         ltp = float(quote_data['last_price'])
-        #         df.loc[now] = [ltp, ltp, ltp, ltp]
-        #         print(f"📊 Added live candle for {index} at {ltp}")
-
     else:
-        # Load data from test.csv for backtest
-        df = load_historical_data(index, f"testing_data/{index}_test.csv")
+        # Use provided window for backtest
+        df = window_df
 
-    # Ensure we have consistent history window (SAME AS validate)
-    if len(df) > MAX_BARS_BACK:
-        df = df.iloc[-MAX_BARS_BACK:].copy()
+    # Skip validation in backtest if precalc provided
+    if not precalc_data:
+        # Ensure we have consistent history window
+        if len(df) > MAX_BARS_BACK:
+            df = df.iloc[-MAX_BARS_BACK:].copy()
 
-    # Validate minimum data requirements (SAME AS validate)
-    if not validate_minimum_data_requirements(df, index):
-        return
+        # Validate minimum data requirements
+        if not validate_minimum_data_requirements(df, index):
+            return
 
-    # Build features
-    features = build_features(df)
-    if len(features) < LOOKAHEAD:
-        print(f"Not enough features for {index}")
-        return
+    # Use pre-calculated or calculate fresh
+    if precalc_data:
+        features = precalc_data['features']
+        current_signal = precalc_data['prediction']
+        current_bullish = precalc_data['bullish']
+        current_bearish = precalc_data['bearish']
+        current_atr = precalc_data['atr']
+    else:
+        # Build features
+        features = build_features(df)
+        if len(features) < LOOKAHEAD:
+            print(f"Not enough features for {index}")
+            return
 
-    # Generate predictions
-    predictions = predict_labels(features, df['close'])
+        # Generate predictions
+        predictions = predict_labels(features, df['close'])
+        current_signal = predictions.iloc[-1]
+
+        # Get kernel signals
+        bullish, bearish, rk, gk = get_kernel_signals(df['close'])
+        current_bullish = bullish.iloc[-1]
+        current_bearish = bearish.iloc[-1]
+
+        # Calculate ATR
+        atr = calculate_atr(df)
+        current_atr = atr.iloc[-1] if len(atr) > 0 and not pd.isna(atr.iloc[-1]) else 0
 
     # Get current values
-    current_signal = predictions.iloc[-1]
-    # Fix: Ensure we get the actual datetime, not row number
-    if isinstance(df.index[-1], pd.Timestamp):
-        current_time = df.index[-1].strftime('%Y-%m-%d %H:%M:%S')
-    else:
-        # Fallback if index isn't datetime
-        current_time = str(df.index[-1])
-        if DEBUG:
-            print(f"⚠️ Warning: Index is not datetime type for {index}")
+    current_time = df.index[-1].strftime('%Y-%m-%d %H:%M:%S') if isinstance(df.index[-1], pd.Timestamp) else str(df.index[-1])
     current_price = df['close'].iloc[-1]
-
-    # Get kernel signals
-    bullish, bearish, rk, gk = get_kernel_signals(df['close'])
-    current_bullish = bullish.iloc[-1]
-    current_bearish = bearish.iloc[-1]
 
     # Get current position
     current_position = signal_state.get_position(index)
     bars_held = signal_state.get_bars_held(index)
 
-    # Calculate ATR
-    atr = calculate_atr(df)
-    current_atr = atr.iloc[-1] if len(atr) > 0 and not pd.isna(atr.iloc[-1]) else 0
-
     action_taken = None
 
-    # Calculate all filters (SAME AS validate)
+    # Calculate all filters (always fresh, they're fast)
     current_vol_filter = calculate_volatility_filter(df['close'], USE_VOLATILITY_FILTER)
     current_regime_filter = calculate_regime_filter(df['close'], REGIME_THRESHOLD, USE_REGIME_FILTER)
 
@@ -1050,6 +1045,40 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
             print(f"📊 {index}: {log_str}")
 
 
+def predict_labels_single(features, close_series, current_idx):
+    """Optimized prediction for single candle"""
+    X = features.values.astype(np.float64)
+    close = close_series.values
+    n = len(X)
+
+    # Create labels
+    Y = np.zeros(n, dtype=np.int32)
+    for i in range(n - LOOKAHEAD):
+        future_close = close[i + LOOKAHEAD]
+        current_close = close[i]
+        delta = (future_close - current_close) / current_close
+
+        if delta > LABEL_THRESHOLD:
+            Y[i] = 1
+        elif delta < -LABEL_THRESHOLD:
+            Y[i] = -1
+
+    # Only predict for current candle
+    i = current_idx
+    max_lookback = min(i, MAX_BARS_BACK)
+
+    if max_lookback < NEIGHBOR_COUNT:
+        return 0
+
+    vote_sum, vote_count = process_single_prediction_pine(X, Y, i, max_lookback, NEIGHBOR_COUNT)
+
+    MIN_CONSENSUS_RATIO = 0.6
+    if vote_count >= LUCKY_NUMBER:
+        consensus_ratio = abs(vote_sum) / vote_count
+        if abs(vote_sum) >= CONFIDENCE_THRESHOLD and consensus_ratio >= MIN_CONSENSUS_RATIO:
+            return int(np.sign(vote_sum))
+    return 0
+
 # === Data Fetching ===
 def fetch_ohlc(symbol, interval=CANDLE_INTERVAL_MINUTES, months=10):
     """Fetch OHLC data from Dhan"""
@@ -1088,39 +1117,65 @@ def fetch_ohlc(symbol, interval=CANDLE_INTERVAL_MINUTES, months=10):
 
 
 def process_index_backtest(index_dict, backtest_state_lock):
-    """Process backtest for a single index in parallel"""
+    """Optimized backtest processing"""
     symbol, index = next(iter(index_dict.items()))
-
-    # Create index-specific state file to avoid conflicts
     index_state = SignalState(filepath=f"backtest_signal_state_{index}.json")
     trade_recorder = TradeRecorder()
 
     print(f"\n🔄 Starting backtest for {index}...")
 
-    trade_count = 0
-    while move_first_row(f'testing_data/{index}_input.csv', f'testing_data/{index}_test.csv'):
+    # Load all data once
+    input_df = pd.read_csv(f'testing_data/{index}_input.csv')
+    test_df = pd.read_csv(f'testing_data/{index}_test.csv')
+    all_data = pd.concat([input_df, test_df], ignore_index=True)
+    all_data['datetime'] = pd.to_datetime(all_data['datetime'])
+    all_data.set_index('datetime', inplace=True)
+
+    # Pre-calculate everything
+    print(f"Pre-calculating features for {index}...")
+    all_features = build_features(all_data)
+    all_atr = calculate_atr(all_data)
+    all_bullish, all_bearish, all_rk, all_gk = get_kernel_signals(all_data['close'])
+
+    test_start_idx = len(input_df)
+
+    for i in range(test_start_idx, len(all_data)):
+        window_start = max(0, i - 4999)
+        window_df = all_data.iloc[window_start:i + 1]
+
+        # Prepare pre-calculated data
+        precalc_data = {
+            'features': all_features.iloc[window_start:i + 1],
+            'prediction': predict_labels_single(
+                all_features.iloc[window_start:i + 1],
+                all_data['close'].iloc[window_start:i + 1],
+                i - window_start
+            ),
+            'bullish': all_bullish.iloc[i],
+            'bearish': all_bearish.iloc[i],
+            'atr': all_atr.iloc[i] if i < len(all_atr) else 0
+        }
+
         try:
-            # Process using the SAME function as live mode
             process_symbol(
                 symbol_dict=index_dict,
                 signal_state=index_state,
                 trader=None,
                 quote_data=None,
                 mode='backtest',
-                trade_recorder=trade_recorder
+                trade_recorder=trade_recorder,
+                window_df=window_df,
+                precalc_data=precalc_data
             )
-            trade_count += 1
 
-            # Progress update every 100 trades
-            if trade_count % 100 == 0:
-                print(f"  {index}: Processed {trade_count} candles...")
+            if (i - test_start_idx) % 100 == 0:
+                print(f"  {index}: Processed {i - test_start_idx} candles...")
 
         except Exception as e:
-            print(f"  ❌ Error processing {index}: {str(e)}")
+            print(f"  ❌ Error processing {index} at {i}: {str(e)}")
 
-    print(f"✅ Completed {index} backtest: {trade_count} candles processed")
+    print(f"✅ Completed {index} backtest: {len(test_df)} candles processed")
 
-    # Clean up index-specific state file
     if os.path.exists(f"backtest_signal_state_{index}.json"):
         os.remove(f"backtest_signal_state_{index}.json")
 
@@ -1134,10 +1189,10 @@ def run_backtest_analysis():
     print("=" * 80 + "\n")
 
     indices = [
-        {"13": "NIFTY"},
-        {"25": "BANKNIFTY"},
-        {"51": "SENSEX"},
-        {"27": "FINNIFTY"},
+        # {"13": "NIFTY"},
+        # {"25": "BANKNIFTY"},
+        # {"51": "SENSEX"},
+        # {"27": "FINNIFTY"},
         {"442": "MIDCPNIFTY"}
     ]
 
