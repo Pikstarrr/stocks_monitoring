@@ -79,7 +79,7 @@ CANDLE_COMPLETION_BUFFER = 5  # Seconds to wait after candle closes
 # Add realistic execution price (slight slippage)
 BACKTEST_SLIPPAGE = 0.02  # 0.02% slippage
 
-
+MIN_CONSENSUS_RATIO = 0.6
 
 class SignalState:
     """Manages signal persistence across runs"""
@@ -536,7 +536,7 @@ def predict_labels(features, close_series):
         )
 
         # ADD THIS: Require 60% consensus for high-quality signals
-        MIN_CONSENSUS_RATIO = 0.6
+
         if vote_count >= LUCKY_NUMBER:  # Need at least 3 votes
             consensus_ratio = abs(vote_sum) / vote_count
             if abs(vote_sum) >= CONFIDENCE_THRESHOLD and consensus_ratio >= MIN_CONSENSUS_RATIO:
@@ -725,6 +725,39 @@ def calculate_entry_quality(df, signal_type):
     return quality_score
 
 
+def predict_labels_single(features, close_series, current_idx):
+    """Optimized prediction for single candle"""
+    X = features.values.astype(np.float64)
+    close = close_series.values
+    n = len(X)
+
+    # Create labels
+    Y = np.zeros(n, dtype=np.int32)
+    for i in range(n - LOOKAHEAD):
+        future_close = close[i + LOOKAHEAD]
+        current_close = close[i]
+        delta = (future_close - current_close) / current_close
+
+        if delta > LABEL_THRESHOLD:
+            Y[i] = 1
+        elif delta < -LABEL_THRESHOLD:
+            Y[i] = -1
+
+    # Only predict for current candle
+    i = current_idx
+    max_lookback = min(i, MAX_BARS_BACK)
+
+    if max_lookback < NEIGHBOR_COUNT:
+        return 0
+
+    vote_sum, vote_count = process_single_prediction_pine(X, Y, i, max_lookback, NEIGHBOR_COUNT)
+
+    if vote_count >= LUCKY_NUMBER:
+        consensus_ratio = abs(vote_sum) / vote_count
+        if abs(vote_sum) >= CONFIDENCE_THRESHOLD and consensus_ratio >= MIN_CONSENSUS_RATIO:
+            return int(np.sign(vote_sum))
+    return 0
+
 def calculate_market_structure(df):
     """Identify market regime - only trade with it"""
     # Need enough data for all MAs
@@ -908,7 +941,7 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
                 if DEBUG:
                     print(f"  🕐 Forcing exit at 3:15 PM for intraday square-off")
 
-        profit_target_hit = profit_pct >= 0.1  # 0.1% profit target
+        profit_target_hit = current_price >= entry_price  # 0.1% profit target
         # early_exit_signal = check_early_exit_signals(df, 'LONG', bars_held, entry_price)
         # stop_loss_hit = profit_pct <= -0.1  # 0.05% stop loss - TIGHT!
         strict_exit = bars_held >= STRICT_EXIT_BARS
@@ -941,7 +974,7 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
                     print(f"  🕐 Forcing exit at 3:15 PM for intraday square-off")
 
         # Exit conditions with profit target and stop loss
-        profit_target_hit = profit_pct >= 0.1  # 0.1% profit target
+        profit_target_hit = current_price <= entry_price  # 0.1% profit target
         # early_exit_signal = check_early_exit_signals(df, 'SHORT', bars_held, entry_price)
         strict_exit = bars_held >= STRICT_EXIT_BARS
         opposite_signal = persisted_signal == 1 and current_bullish and long_filters
@@ -1044,40 +1077,6 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
         if DEBUG and mode == 'live':  # Only log in live mode to reduce noise
             print(f"📊 {index}: {log_str}")
 
-
-def predict_labels_single(features, close_series, current_idx):
-    """Optimized prediction for single candle"""
-    X = features.values.astype(np.float64)
-    close = close_series.values
-    n = len(X)
-
-    # Create labels
-    Y = np.zeros(n, dtype=np.int32)
-    for i in range(n - LOOKAHEAD):
-        future_close = close[i + LOOKAHEAD]
-        current_close = close[i]
-        delta = (future_close - current_close) / current_close
-
-        if delta > LABEL_THRESHOLD:
-            Y[i] = 1
-        elif delta < -LABEL_THRESHOLD:
-            Y[i] = -1
-
-    # Only predict for current candle
-    i = current_idx
-    max_lookback = min(i, MAX_BARS_BACK)
-
-    if max_lookback < NEIGHBOR_COUNT:
-        return 0
-
-    vote_sum, vote_count = process_single_prediction_pine(X, Y, i, max_lookback, NEIGHBOR_COUNT)
-
-    MIN_CONSENSUS_RATIO = 0.6
-    if vote_count >= LUCKY_NUMBER:
-        consensus_ratio = abs(vote_sum) / vote_count
-        if abs(vote_sum) >= CONFIDENCE_THRESHOLD and consensus_ratio >= MIN_CONSENSUS_RATIO:
-            return int(np.sign(vote_sum))
-    return 0
 
 # === Data Fetching ===
 def fetch_ohlc(symbol, interval=CANDLE_INTERVAL_MINUTES, months=10):

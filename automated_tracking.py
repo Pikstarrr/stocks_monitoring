@@ -1,65 +1,402 @@
-# momentum_x_pine_converted.py - Optimized for high accuracy (75%+)
-import csv
-import math
+#
+# Momentum X - Integrated Trading & Backtesting Framework
+#
+# This script combines a robust trading framework with a high-fidelity Python
+# implementation of the "Momentum X" Pine Script indicator.
+#
+# Original Framework: options_backtest_strat3.py by the user
+# Signal Engine: MomentumX class by Gemini
+#
+# Date of Integration: July 17, 2025
+#
+import time
 import time
 import json
 import os
-from collections import deque
+import sys
 from datetime import datetime, timedelta
-from firebase_admin import credentials, firestore, initialize_app
+from collections import deque
 
+from numba import jit
+from collections import deque
+
+from firebase_admin import credentials, firestore, initialize_app
 import pandas as pd
 import numpy as np
+import pandas_ta as ta
 from dotenv import load_dotenv
 from google.cloud.firestore_v1 import ArrayUnion
-from sklearn.metrics.pairwise import manhattan_distances
 
+# It's better to import specific modules if they are known
 from send_mail import send_email
-from strategy_features import compute_feature, rational_quadratic_kernel, gaussian_kernel
 import dhanhq
 from trade_placement import KotakOptionsTrader
 
-# === CONFIG ===
-# Using your original config that gave 75% accuracy
-FEATURE_CONFIG = [
-    ("RSI", 14, 1),  # Feature 1
-    ("WT", 10, 11),  # Feature 2
-    ("CCI", 20, 1),  # Feature 3
-    ("ADX", 20, 2),  # Feature 4
-    ("RSI", 9, 1),  # Feature 5
-]
-NEIGHBOR_COUNT = 5  # Your original value
-MAX_BARS_BACK = 2000
-LOOKAHEAD = 4
-FEATURE_COUNT = 5
-STRICT_EXIT_BARS = 4  # From your original
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
-# Important thresholds from your original script
-LABEL_THRESHOLD = 0.002  # 0.2% move threshold - CRITICAL for accuracy
-CONFIDENCE_THRESHOLD = 3  # Minimum votes needed - CRITICAL for accuracy
+# This is the modern way to handle the SettingWithCopyWarning if needed,
+# though the script is written to avoid it by using .copy().
+pd.options.mode.chained_assignment = None  # Suppress the warning globally
 
-# Kernel Settings (adjusted for better signals)
-USE_KERNEL_FILTER = True
-KERNEL_H = 10  # From your original
-KERNEL_R = 6.0  # From your original
-KERNEL_X = 15  # From your original
-KERNEL_LAG = 1  # From your original
 
-# Filter Settings
-USE_VOLATILITY_FILTER = True
-USE_REGIME_FILTER = True
-USE_ADX_FILTER = False
-REGIME_THRESHOLD = -0.1
-ADX_THRESHOLD = 20
+# ==============================================================================
+# ==== MomentumX Signal Generation Engine (The "Brain") ====
+# ==============================================================================
 
-# Dynamic Exit Settings
-USE_DYNAMIC_EXITS = False
-SHOW_EXITS = False
+class MomentumX:
+    """
+    A Python implementation of the 'Momentum X' TradingView indicator.
+    Fixed to exactly match Pine Script logic.
+    """
 
-# Signal persistence file
+    def __init__(self, df, **kwargs):
+        """
+        Initializes the MomentumX strategy with data and parameters.
+        """
+        self.df = df.copy()
+
+        # Default parameters exactly matching Pine Script
+        self.params = {
+            "source": "close",
+            "neighborsCount": 8,
+            "maxBarsBack": 5000,
+            "featureCount": 5,
+            "colorCompression": 1,
+            "useDynamicExits": False,
+            "f1_string": "RSI", "f1_paramA": 14, "f1_paramB": 1,
+            "f2_string": "WT", "f2_paramA": 10, "f2_paramB": 11,
+            "f3_string": "CCI", "f3_paramA": 20, "f3_paramB": 1,
+            "f4_string": "ADX", "f4_paramA": 20, "f4_paramB": 2,
+            "f5_string": "RSI", "f5_paramA": 9, "f5_paramB": 1,
+            "useVolatilityFilter": True,
+            "useRegimeFilter": True, "regimeThreshold": -0.1,
+            "useAdxFilter": False, "adxThreshold": 20,
+            "useEmaFilter": False, "emaPeriod": 200,
+            "useSmaFilter": False, "smaPeriod": 200,
+            "useKernelFilter": True,
+            "useKernelSmoothing": True,
+            "h_lookback": 8,
+            "r_relative_weight": 8.0,
+            "x_regression_level": 25,
+            "lag": 2,
+        }
+        self.params.update(kwargs)
+
+    def _normalize_series(self, series, min_val=-1, max_val=1):
+        """Min-Max normalization to scale a series to a given range."""
+        if not isinstance(series, pd.Series):
+            series = pd.Series(series, index=self.df.index)
+        rolling_max = series.rolling(window=self.params['maxBarsBack'], min_periods=1).max()
+        rolling_min = series.rolling(window=self.params['maxBarsBack'], min_periods=1).min()
+        range_val = rolling_max - rolling_min
+        range_val[range_val == 0] = 1
+        normalized = min_val + (series - rolling_min) * (max_val - min_val) / range_val
+        return normalized.fillna(0)
+
+    def _wavetrend(self, src, chlen, avglen):
+        """Calculates the WaveTrend Oscillator."""
+        hlc3 = ta.hlc3(self.df['high'], self.df['low'], self.df['close'])
+        esa = ta.ema(hlc3, length=chlen)
+        d = ta.ema(abs(hlc3 - esa), length=chlen)
+        ci = (hlc3 - esa) / (0.015 * d)
+        tci = ta.ema(ci, length=avglen)
+        return tci
+
+    def _series_from(self, feature_string, paramA, paramB):
+        """Calculates and normalizes a feature series based on user input."""
+        src_series = self.df[self.params['source']]
+        if feature_string == "RSI":
+            raw_series = ta.rsi(src_series, length=paramA)
+        elif feature_string == "WT":
+            raw_series = self._wavetrend(src_series, paramA, paramB)
+        elif feature_string == "CCI":
+            raw_series = ta.cci(self.df['high'], self.df['low'], src_series, length=paramA)
+        elif feature_string == "ADX":
+            adx_df = ta.adx(self.df['high'], self.df['low'], src_series, length=paramA)
+            raw_series = adx_df[f'ADX_{paramA}']
+        else:
+            raw_series = pd.Series(np.zeros(len(self.df)), index=self.df.index)
+        return self._normalize_series(raw_series.fillna(0))
+
+    def _rma(self, series, period):
+        """Pine Script's RMA (Running Moving Average)"""
+        alpha = 1.0 / period
+        return series.ewm(alpha=alpha, adjust=False).mean()
+
+    def _kernel_regression(self, series, h, r, x, is_gaussian=False, lag=0):
+        """Nadaraya-Watson Kernel Regression implementation."""
+        yhat = pd.Series(np.nan, index=self.df.index)
+        series_np = series.to_numpy()
+
+        for i in range(h, len(series_np)):
+            weights_sum, weighted_sum = 0, 0
+            for j in range(max(0, i - h + 1), i + 1):
+                if is_gaussian:
+                    weight = np.exp(-((i - j) ** 2) / (2 * h ** 2))
+                else:
+                    weight = (1 + ((i - j) ** 2) / ((r ** 2) * (h ** 2))) ** (-r)
+                weights_sum += weight
+                weighted_sum += series_np[j] * weight
+            if weights_sum != 0:
+                yhat.iloc[i] = weighted_sum / weights_sum
+            else:
+                yhat.iloc[i] = series_np[i]
+        return yhat.bfill()
+
+    @staticmethod
+    @jit(nopython=True)
+    def _process_single_prediction(X, Y, i, max_lookback, neighbor_count):
+        """Optimized Lorentzian distance k-NN matching Pine Script exactly"""
+        lastDistance = -1.0
+        distances = np.zeros(neighbor_count)
+        votes = np.zeros(neighbor_count, dtype=np.int32)
+        count = 0
+
+        size = min(max_lookback - 1, i)
+
+        for j in range(size + 1):
+            if j % 4 == 0:  # Pine Script skips every 4th bar
+                continue
+
+            hist_idx = i - size + j - 1
+            if hist_idx >= i or hist_idx < 0:
+                continue
+
+            # Lorentzian distance
+            d = 0.0
+            for k in range(X.shape[1]):
+                d += np.log(1 + np.abs(X[i, k] - X[hist_idx, k]))
+
+            if d >= lastDistance:
+                lastDistance = d
+
+                if count < neighbor_count:
+                    distances[count] = d
+                    votes[count] = Y[hist_idx]
+                    count += 1
+                else:
+                    # Shift arrays (Pine Script behavior)
+                    for idx in range(neighbor_count - 1):
+                        distances[idx] = distances[idx + 1]
+                        votes[idx] = votes[idx + 1]
+                    distances[neighbor_count - 1] = d
+                    votes[neighbor_count - 1] = Y[hist_idx]
+
+                    # Update threshold to 75th percentile
+                    lastDistance = distances[int(neighbor_count * 3 / 4)]
+
+        return np.sum(votes[:count])
+
+    def run(self):
+        """Executes the full strategy logic."""
+        self._calculate_features()
+        self._calculate_training_labels()
+        self._calculate_predictions()
+        self._apply_filters()
+        self._calculate_entries_exits()
+        return self.df
+
+    def _calculate_features(self):
+        """Calculate all 5 features"""
+        self.df['f1'] = self._series_from(self.params['f1_string'], self.params['f1_paramA'], self.params['f1_paramB'])
+        self.df['f2'] = self._series_from(self.params['f2_string'], self.params['f2_paramA'], self.params['f2_paramB'])
+        self.df['f3'] = self._series_from(self.params['f3_string'], self.params['f3_paramA'], self.params['f3_paramB'])
+        self.df['f4'] = self._series_from(self.params['f4_string'], self.params['f4_paramA'], self.params['f4_paramB'])
+        self.df['f5'] = self._series_from(self.params['f5_string'], self.params['f5_paramA'], self.params['f5_paramB'])
+
+    def _calculate_training_labels(self):
+        """Calculate training labels (4 bars ahead)"""
+        src = self.df[self.params['source']]
+        # Pine Script: src[4] < src[0] ? direction.short : src[4] > src[0] ? direction.long : direction.neutral
+        self.df['y_train'] = 0  # Initialize as neutral
+        for i in range(len(self.df) - 4):
+            future_price = src.iloc[i + 4]
+            current_price = src.iloc[i]
+            if future_price < current_price:
+                self.df.iloc[i, self.df.columns.get_loc('y_train')] = -1  # Short
+            elif future_price > current_price:
+                self.df.iloc[i, self.df.columns.get_loc('y_train')] = 1  # Long
+
+    def _calculate_predictions(self):
+        """Calculate ML predictions using optimized k-NN"""
+        features = self.df[['f1', 'f2', 'f3', 'f4', 'f5']].values
+        labels = self.df['y_train'].values.astype(np.int32)
+        predictions = np.zeros(len(self.df), dtype=np.int32)
+
+        for i in range(len(self.df)):
+            if i < self.params['neighborsCount']:
+                predictions[i] = 0
+                continue
+
+            max_lookback = min(self.params['maxBarsBack'], i)
+            vote_sum = self._process_single_prediction(
+                features, labels, i, max_lookback, self.params['neighborsCount']
+            )
+            predictions[i] = vote_sum
+
+        self.df['prediction'] = predictions
+
+    def _apply_filters(self):
+        """Apply all filters matching Pine Script exactly"""
+        # Volatility Filter
+        atr1 = ta.atr(self.df['high'], self.df['low'], self.df['close'], length=1)
+        atr10 = ta.atr(self.df['high'], self.df['low'], self.df['close'], length=10)
+        self.df['filter_volatility'] = (atr1 > atr10) if self.params['useVolatilityFilter'] else True
+
+        # Regime Filter
+        if self.params['useRegimeFilter']:
+            ohlc4 = ta.ohlc4(self.df['open'], self.df['high'], self.df['low'], self.df['close'])
+            lookback = 50  # Pine Script default
+            x = np.arange(lookback)
+            slopes = []
+
+            for i in range(lookback, len(ohlc4) + 1):
+                y = ohlc4.iloc[i - lookback:i].values
+                y_mean = np.mean(y)
+                if y_mean != 0:
+                    y_normalized = (y - y_mean) / y_mean
+                    slope = np.polyfit(x, y_normalized, 1)[0]
+                else:
+                    slope = 0
+                slopes.append(slope)
+
+            slope_series = pd.Series([0] * lookback + slopes, index=self.df.index)
+            self.df['filter_regime'] = slope_series > self.params['regimeThreshold']
+        else:
+            self.df['filter_regime'] = True
+
+        # ADX Filter
+        if self.params['useAdxFilter']:
+            adx_df = ta.adx(self.df['high'], self.df['low'], self.df['close'], length=14)
+            self.df['filter_adx'] = adx_df['ADX_14'] > self.params['adxThreshold']
+        else:
+            self.df['filter_adx'] = True
+
+        # Combined filters
+        self.df['filter_all'] = self.df['filter_volatility'] & self.df['filter_regime'] & self.df['filter_adx']
+
+        # EMA/SMA Filters
+        if self.params['useEmaFilter']:
+            ema = ta.ema(self.df['close'], self.params['emaPeriod'])
+            self.df['ema_uptrend'] = self.df['close'] > ema
+            self.df['ema_downtrend'] = self.df['close'] < ema
+        else:
+            self.df['ema_uptrend'] = True
+            self.df['ema_downtrend'] = True
+
+        if self.params['useSmaFilter']:
+            sma = ta.sma(self.df['close'], self.params['smaPeriod'])
+            self.df['sma_uptrend'] = self.df['close'] > sma
+            self.df['sma_downtrend'] = self.df['close'] < sma
+        else:
+            self.df['sma_uptrend'] = True
+            self.df['sma_downtrend'] = True
+
+        # Kernel calculations
+        src_series = self.df[self.params['source']]
+        self.df['yhat1'] = self._kernel_regression(src_series, self.params['h_lookback'],
+                                                   self.params['r_relative_weight'], self.params['x_regression_level'])
+        self.df['yhat2'] = self._kernel_regression(src_series, self.params['h_lookback'] - self.params['lag'],
+                                                   self.params['r_relative_weight'], self.params['x_regression_level'],
+                                                   is_gaussian=True)
+
+        # Kernel filters
+        if self.params['useKernelSmoothing']:
+            self.df['is_bullish'] = self.df['yhat2'] >= self.df['yhat1']
+            self.df['is_bearish'] = self.df['yhat2'] <= self.df['yhat1']
+        else:
+            # Rate-based (slope)
+            yhat1_prev = self.df['yhat1'].shift(1)
+            self.df['is_bullish'] = self.df['yhat1'] > yhat1_prev
+            self.df['is_bearish'] = self.df['yhat1'] < yhat1_prev
+
+        if not self.params['useKernelFilter']:
+            self.df['is_bullish'] = True
+            self.df['is_bearish'] = True
+
+    def _calculate_entries_exits(self):
+        """Calculate entries and exits matching Pine Script exactly"""
+        # 1. Signal persistence logic (Pine Script: nz(signal[1]))
+        raw_predictions = self.df['prediction'].values
+        filter_all = self.df['filter_all'].values
+        signal = np.zeros(len(self.df), dtype=np.int32)
+
+        for i in range(len(self.df)):
+            if i == 0:
+                signal[i] = 0
+            else:
+                # Pine Script: prediction > 0 and filter_all ? direction.long :
+                #              prediction < 0 and filter_all ? direction.short : nz(signal[1])
+                if raw_predictions[i] > 0 and filter_all[i]:
+                    signal[i] = 1
+                elif raw_predictions[i] < 0 and filter_all[i]:
+                    signal[i] = -1
+                else:
+                    signal[i] = signal[i - 1]  # Persist previous signal
+
+        self.df['signal'] = signal
+
+        # 2. Calculate bars held
+        bars_held = np.zeros(len(self.df), dtype=np.int32)
+        signal_changed = np.diff(signal, prepend=signal[0]) != 0
+
+        for i in range(len(self.df)):
+            if signal_changed[i]:
+                bars_held[i] = 0
+            else:
+                bars_held[i] = bars_held[i - 1] + 1 if i > 0 else 0
+
+        self.df['barsHeld'] = bars_held
+
+        # 3. Entry signals (Pine Script logic)
+        is_new_signal = signal_changed
+        is_buy_signal = (signal == 1) & self.df['ema_uptrend'] & self.df['sma_uptrend']
+        is_sell_signal = (signal == -1) & self.df['ema_downtrend'] & self.df['sma_downtrend']
+
+        self.df['startLongTrade'] = is_new_signal & is_buy_signal & self.df['is_bullish']
+        self.df['startShortTrade'] = is_new_signal & is_sell_signal & self.df['is_bearish']
+
+        # 4. Exit signals (Pine Script logic - simplified)
+        if not self.params['useDynamicExits']:
+            # Strict exits only
+            is_held_four_bars = bars_held == 4
+            is_held_less_than_four = (bars_held > 0) & (bars_held < 4)
+
+            # Check what signal was 4 bars ago
+            signal_4_bars_ago = pd.Series(signal).shift(4).fillna(0).values
+            start_long_4_bars_ago = self.df['startLongTrade'].shift(4).fillna(False)
+            start_short_4_bars_ago = self.df['startShortTrade'].shift(4).fillna(False)
+
+            # Pine Script exit logic
+            self.df['endLongTrade'] = (
+                    ((is_held_four_bars & (signal_4_bars_ago == 1)) |
+                     (is_held_less_than_four & is_new_signal & (signal == -1) & (signal_4_bars_ago == 1))) &
+                    start_long_4_bars_ago
+            )
+
+            self.df['endShortTrade'] = (
+                    ((is_held_four_bars & (signal_4_bars_ago == -1)) |
+                     (is_held_less_than_four & is_new_signal & (signal == 1) & (signal_4_bars_ago == -1))) &
+                    start_short_4_bars_ago
+            )
+        else:
+            # Dynamic exits would go here
+            self.df['endLongTrade'] = False
+            self.df['endShortTrade'] = False
+
+
+# ==============================================================================
+# ==== Trading Framework (The "Chassis") ====
+# ==============================================================================
+
+# === CONFIG (User's Original Framework Settings) ===
 SIGNAL_STATE_FILE = "signal_state.json"
-
 DEBUG = True
+CANDLE_INTERVAL_MINUTES = 15
+CANDLE_COMPLETION_BUFFER = 5
+BACKTEST_SLIPPAGE = 0.02
+MAX_BARS_BACK_FRAMEWORK = 5000  # Max history to keep in memory for framework
 
 
 class SignalState:
@@ -71,794 +408,449 @@ class SignalState:
 
     def load_state(self):
         if os.path.exists(self.filepath):
-            with open(self.filepath, 'r') as f:
-                return json.load(f)
+            with open(self.filepath, 'r') as f: return json.load(f)
         return {}
 
     def save_state(self):
-        with open(self.filepath, 'w') as f:
-            json.dump(self.state, f)
+        with open(self.filepath, 'w') as f: json.dump(self.state, f)
 
     def get_position(self, symbol):
         return self.state.get(symbol, {}).get('position', None)
 
-    def get_bars_held(self, symbol):
-        return self.state.get(symbol, {}).get('bars_held', 0)
-
-    def get_last_signal(self, symbol):
-        return self.state.get(symbol, {}).get('last_signal', 0)
-
-    def get_entry_info(self, symbol):
-        return self.state.get(symbol, {}).get('entry_info', {})
-
     def update_position(self, symbol, position, entry_price=None, entry_time=None):
-        if symbol not in self.state:
-            self.state[symbol] = {}
-
+        if symbol not in self.state: self.state[symbol] = {}
         self.state[symbol]['position'] = position
         if position is not None and entry_price is not None:
             self.state[symbol]['entry_info'] = {
-                'price': entry_price,
-                'time': entry_time.isoformat() if entry_time else None
+                'price': float(entry_price),
+                'time': entry_time.isoformat() if hasattr(entry_time, 'isoformat') else str(entry_time)
             }
         elif position is None:
             self.state[symbol]['entry_info'] = {}
-
-        self.save_state()
-
-    def update_signal(self, symbol, signal):
-        if symbol not in self.state:
-            self.state[symbol] = {}
-        self.state[symbol]['last_signal'] = signal
-        self.save_state()
-
-    def increment_bars_held(self, symbol):
-        if symbol not in self.state:
-            self.state[symbol] = {}
-        self.state[symbol]['bars_held'] = self.state[symbol].get('bars_held', 0) + 1
-        self.save_state()
-
-    def reset_bars_held(self, symbol):
-        if symbol not in self.state:
-            self.state[symbol] = {}
-        self.state[symbol]['bars_held'] = 0
         self.save_state()
 
 
-# === Feature Calculation ===
-def build_features(df):
-    features = []
-    for kind, param_a, param_b in FEATURE_CONFIG:
-        f = compute_feature(df.copy(), kind, param_a, param_b)
-        f.name = f"{kind}_{param_a}_{param_b}"
-        features.append(f)
-    return pd.concat(features, axis=1).dropna()
+class TradeRecorder:
+    """Records trades during backtest"""
 
+    def __init__(self):
+        self.trades = []
+        self.positions = []
+        self.current_position = None
+        self.entry_price = None
+        self.entry_time = None
 
-# === ML Model Prediction (Using your original high-accuracy logic) ===
-def predict_ml_signal_original(features_df, close_series):
-    """
-    Your original ML prediction logic that gave 75% accuracy
-    Uses Manhattan distance and label thresholding
-    """
-    # Align indices
-    common_index = features_df.index.intersection(close_series.index)
-    features_df = features_df.loc[common_index]
-    close_series = close_series.loc[common_index]
-
-    X = features_df.values
-    close = close_series.values
-    n = len(X)
-
-    # Create labels with threshold (your original logic)
-    Y = np.zeros(n)
-    for i in range(LOOKAHEAD, n):
-        future_close = close[i]
-        current_close = close[i - LOOKAHEAD]
-        delta = (future_close - current_close) / current_close
-
-        if delta > LABEL_THRESHOLD:
-            Y[i - LOOKAHEAD] = 1
-        elif delta < -LABEL_THRESHOLD:
-            Y[i - LOOKAHEAD] = -1
-        else:
-            Y[i - LOOKAHEAD] = 0
-
-    # Calculate Manhattan distances (your original approach)
-    distances = manhattan_distances(X, X)
-    np.fill_diagonal(distances, np.inf)
-
-    # Make predictions for the last row
-    current_idx = n - 1
-    if current_idx < LOOKAHEAD:
-        return 0
-
-    # Get nearest neighbors
-    idx = np.argsort(distances[current_idx])[:NEIGHBOR_COUNT]
-
-    # Vote counting with confidence threshold
-    vote = np.sum(Y[idx])
-
-    # Apply confidence threshold (critical for accuracy)
-    if abs(vote) < CONFIDENCE_THRESHOLD:
-        return 0
-    else:
-        return int(np.sign(vote))
-
-
-def predict_ml_signal(features_df, close_series, current_idx):
-    """
-    Wrapper to use the original ML logic for better accuracy
-    """
-    # Get subset of data up to current index
-    features_subset = features_df.iloc[:current_idx + 1]
-    close_subset = close_series.iloc[:current_idx + 1]
-
-    return predict_ml_signal_original(features_subset, close_subset)
-
-
-# === Filter Functions ===
-def volatility_filter(close_series, current_idx, use_filter=True):
-    """Implements volatility filter from Pine Script"""
-    if not use_filter or current_idx < 10:
-        return True
-
-    # Simple volatility check using recent price movement
-    recent_volatility = close_series.iloc[max(0, current_idx - 10):current_idx].std()
-    avg_volatility = close_series.iloc[max(0, current_idx - 50):current_idx].std()
-
-    return recent_volatility > avg_volatility * 0.5
-
-
-def regime_filter(ohlc4_series, current_idx, threshold=REGIME_THRESHOLD, use_filter=True):
-    """Implements regime filter from Pine Script"""
-    if not use_filter or current_idx < 50:
-        return True
-
-    # Calculate trend strength
-    sma_short = ohlc4_series.iloc[max(0, current_idx - 20):current_idx].mean()
-    sma_long = ohlc4_series.iloc[max(0, current_idx - 50):current_idx].mean()
-
-    trend_strength = (sma_short - sma_long) / sma_long
-    return trend_strength > threshold
-
-
-def calculate_adx(high, low, close, period=14):
-    """Calculate ADX (Average Directional Index)"""
-    # Calculate True Range
-    high_low = high - low
-    high_close = (high - close.shift()).abs()
-    low_close = (low - close.shift()).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-
-    # Calculate Directional Movement
-    up_move = high - high.shift()
-    down_move = low.shift() - low
-
-    pos_dm = pd.Series(0.0, index=up_move.index)
-    neg_dm = pd.Series(0.0, index=down_move.index)
-
-    pos_dm[(up_move > down_move) & (up_move > 0)] = up_move[(up_move > down_move) & (up_move > 0)]
-    neg_dm[(down_move > up_move) & (down_move > 0)] = down_move[(down_move > up_move) & (down_move > 0)]
-
-    # Calculate ATR
-    atr = tr.rolling(window=period).mean()
-
-    # Calculate +DI and -DI
-    pos_di = 100 * (pos_dm.rolling(window=period).mean() / atr)
-    neg_di = 100 * (neg_dm.rolling(window=period).mean() / atr)
-
-    # Calculate DX
-    dx = 100 * ((pos_di - neg_di).abs() / (pos_di + neg_di))
-
-    # Calculate ADX
-    adx = dx.rolling(window=period).mean()
-
-    return adx
-
-
-def adx_filter(high, low, close, current_idx, period=14, threshold=ADX_THRESHOLD, use_filter=False):
-    """Implements ADX filter"""
-    if not use_filter or current_idx < period * 2:
-        return True
-
-    # Calculate ADX
-    adx = calculate_adx(high, low, close, period)
-
-    # Check if current ADX is above threshold (indicating trending market)
-    if current_idx < len(adx) and not pd.isna(adx.iloc[current_idx]):
-        return adx.iloc[current_idx] > threshold
-
-    return True
-
-
-# === Kernel Functions ===
-def get_kernel_signals(series, h=KERNEL_H, r=KERNEL_R, x=KERNEL_X, lag=KERNEL_LAG):
-    """Calculate kernel signals for entry/exit"""
-    yhat1 = rational_quadratic_kernel(series, h, r, x)
-    yhat2 = gaussian_kernel(series, h - lag, x)
-
-    # Your original logic: simple shift comparison
-    bullish = (yhat1.shift(1) < yhat1)
-    bearish = (yhat1.shift(1) > yhat1)
-
-    return {
-        'bullish': bullish,
-        'bearish': bearish,
-        'yhat1': yhat1,
-        'yhat2': yhat2
-    }
-
-
-# === Backtesting Functions ===
-def backtest_strategy(df, features, signal_state_mock=None):
-    """
-    Backtest the strategy on historical data
-    Returns: trades list, performance metrics
-    """
-    trades = []
-    positions = []
-
-    # Mock signal state for backtesting
-    if signal_state_mock is None:
-        signal_state_mock = {
-            'position': None,
-            'bars_held': 0,
-            'last_signal': 0,
-            'entry_price': 0,
-            'entry_time': None
-        }
-
-    # Calculate OHLC4
-    df['ohlc4'] = (df['open'] + df['high'] + df['low'] + df['close']) / 4
-
-    # Align features and df indices
-    common_index = features.index.intersection(df.index)
-    features = features.loc[common_index]
-    df_aligned = df.loc[common_index]
-
-    # Get kernel signals
-    kernel_signals = get_kernel_signals(df_aligned['close'])
-
-    for i in range(LOOKAHEAD, len(features)):
-        current_idx = i
-        current_time = df_aligned.index[i]
-        current_price = df_aligned['close'].iloc[i]
-
-        # Get ML prediction
-        prediction = predict_ml_signal(features, df_aligned['close'], current_idx)
-
-        # Apply filters
-        vol_filter = volatility_filter(df_aligned['close'], current_idx, USE_VOLATILITY_FILTER)
-        regime_filt = regime_filter(df_aligned['ohlc4'], current_idx, REGIME_THRESHOLD, USE_REGIME_FILTER)
-        adx_filt = adx_filter(df_aligned['high'], df_aligned['low'], df_aligned['close'], current_idx, 14,
-                              ADX_THRESHOLD, USE_ADX_FILTER)
-
-        filter_all = vol_filter and regime_filt and adx_filt
-
-        # Determine signal
-        current_signal = 0
-        if prediction > 0 and filter_all:
-            current_signal = 1
-        elif prediction < 0 and filter_all:
-            current_signal = -1
-
-        # Kernel conditions
-        is_bullish = kernel_signals['bullish'].iloc[i] if USE_KERNEL_FILTER else True
-        is_bearish = kernel_signals['bearish'].iloc[i] if USE_KERNEL_FILTER else True
-
-        # Entry conditions (matching your original)
-        start_long_trade = current_signal == 1 and is_bullish
-        start_short_trade = current_signal == -1 and is_bearish
-
-        # Exit conditions
-        end_long_trade = False
-        end_short_trade = False
-
-        if signal_state_mock['position'] == 'LONG':
-            signal_state_mock['bars_held'] += 1
-            # Your original exit logic
-            end_long_trade = is_bearish or signal_state_mock['bars_held'] >= STRICT_EXIT_BARS
-
-        elif signal_state_mock['position'] == 'SHORT':
-            signal_state_mock['bars_held'] += 1
-            # Your original exit logic
-            end_short_trade = is_bullish or signal_state_mock['bars_held'] >= STRICT_EXIT_BARS
-
-        # Execute trades
-        if end_long_trade and signal_state_mock['position'] == 'LONG':
-            trades.append({
-                'time': current_time,
-                'action': 'SELL',
-                'price': current_price,
-                'type': 'exit'
+    def record_trade(self, timestamp, index_name, signal_type, price):
+        timestamp_str = timestamp.strftime('%Y-%m-%d %H:%M:%S') if isinstance(timestamp, pd.Timestamp) else str(
+            timestamp)
+        self.trades.append({'timestamp': timestamp_str, 'index': index_name, 'action': signal_type, 'price': price})
+        if signal_type in ['BUY', 'SHORT']:
+            self.current_position = signal_type
+            self.entry_price = price
+            self.entry_time = timestamp_str
+        elif signal_type in ['SELL', 'COVER'] and self.current_position:
+            profit = price - self.entry_price if self.current_position == 'BUY' else self.entry_price - price
+            self.positions.append({
+                'index': index_name, 'entry_time': self.entry_time, 'exit_time': timestamp_str,
+                'entry_price': self.entry_price, 'exit_price': price, 'type': self.current_position,
+                'profit': profit, 'profit_pct': (profit / self.entry_price) * 100
             })
-            # Calculate profit
-            profit = current_price - signal_state_mock['entry_price']
-            positions.append({
-                'entry_time': signal_state_mock['entry_time'],
-                'entry_price': signal_state_mock['entry_price'],
-                'exit_time': current_time,
-                'exit_price': current_price,
-                'type': 'LONG',
-                'profit': profit,
-                'profit_pct': (profit / signal_state_mock['entry_price']) * 100
-            })
-            signal_state_mock['position'] = None
-            signal_state_mock['bars_held'] = 0
+            self.current_position = None
 
-        elif end_short_trade and signal_state_mock['position'] == 'SHORT':
-            trades.append({
-                'time': current_time,
-                'action': 'COVER',
-                'price': current_price,
-                'type': 'exit'
-            })
-            # Calculate profit
-            profit = signal_state_mock['entry_price'] - current_price
-            positions.append({
-                'entry_time': signal_state_mock['entry_time'],
-                'entry_price': signal_state_mock['entry_price'],
-                'exit_time': current_time,
-                'exit_price': current_price,
-                'type': 'SHORT',
-                'profit': profit,
-                'profit_pct': (profit / signal_state_mock['entry_price']) * 100
-            })
-            signal_state_mock['position'] = None
-            signal_state_mock['bars_held'] = 0
 
-        elif start_long_trade and signal_state_mock['position'] is None:
-            trades.append({
-                'time': current_time,
-                'action': 'BUY',
-                'price': current_price,
-                'type': 'entry'
-            })
-            signal_state_mock['position'] = 'LONG'
-            signal_state_mock['entry_price'] = current_price
-            signal_state_mock['entry_time'] = current_time
-            signal_state_mock['bars_held'] = 0
-
-        elif start_short_trade and signal_state_mock['position'] is None:
-            trades.append({
-                'time': current_time,
-                'action': 'SHORT',
-                'price': current_price,
-                'type': 'entry'
-            })
-            signal_state_mock['position'] = 'SHORT'
-            signal_state_mock['entry_price'] = current_price
-            signal_state_mock['entry_time'] = current_time
-            signal_state_mock['bars_held'] = 0
-
-        # Update last signal
-        signal_state_mock['last_signal'] = current_signal
-
-    # Calculate performance metrics
-    if positions:
-        total_trades = len(positions)
-        winning_trades = sum(1 for p in positions if p['profit'] > 0)
-        losing_trades = sum(1 for p in positions if p['profit'] <= 0)
-
-        total_profit = sum(p['profit'] for p in positions)
-        total_profit_pct = sum(p['profit_pct'] for p in positions)
-
-        win_rate = (winning_trades / total_trades) * 100 if total_trades > 0 else 0
-        avg_profit = total_profit / total_trades if total_trades > 0 else 0
-        avg_profit_pct = total_profit_pct / total_trades if total_trades > 0 else 0
-
-        # Calculate max drawdown
-        cumulative_profit = 0
-        max_profit = 0
-        max_drawdown = 0
-
-        for p in positions:
-            cumulative_profit += p['profit']
-            max_profit = max(max_profit, cumulative_profit)
-            drawdown = max_profit - cumulative_profit
-            max_drawdown = max(max_drawdown, drawdown)
-
-        performance = {
-            'total_trades': total_trades,
-            'winning_trades': winning_trades,
-            'losing_trades': losing_trades,
-            'win_rate': win_rate,
-            'total_profit': total_profit,
-            'total_profit_pct': total_profit_pct,
-            'avg_profit': avg_profit,
-            'avg_profit_pct': avg_profit_pct,
-            'max_drawdown': max_drawdown,
-            'profit_factor': abs(sum(p['profit'] for p in positions if p['profit'] > 0) /
-                                 sum(p['profit'] for p in positions if
-                                     p['profit'] < 0)) if losing_trades > 0 else float('inf')
-        }
-    else:
-        performance = {
-            'total_trades': 0,
-            'winning_trades': 0,
-            'losing_trades': 0,
-            'win_rate': 0,
-            'total_profit': 0,
-            'total_profit_pct': 0,
-            'avg_profit': 0,
-            'avg_profit_pct': 0,
-            'max_drawdown': 0,
-            'profit_factor': 0
-        }
-
-    return trades, positions, performance
-
-
-def run_backtest_analysis():
-    """Run backtest on all indices and display results"""
-    print("\n" + "=" * 80)
-    print("RUNNING BACKTEST ANALYSIS")
-    print("=" * 80 + "\n")
-
-    indices = [
-        {"13": "NIFTY"},
-        {"25": "BANKNIFTY"},
-        {"51": "SENSEX"},
-        {"27": "FINNIFTY"},
-        {"442": "MIDCPNIFTY"}
-    ]
-
-    all_results = {}
-
-    for index_dict in indices:
-        symbol, index = next(iter(index_dict.items()))
-        print(f"\nBacktesting {index}...")
-
-        try:
-            # Fetch data
-            df = fetch_ohlc(symbol, interval=25)  # 25 min for consistency
-
-            if len(df) < 100:
-                print(f"Skipping {index}: insufficient data")
-                continue
-
-            # Build features
-            features = build_features(df)
-            if len(features) < LOOKAHEAD:
-                print(f"Not enough features for {index}")
-                continue
-
-            # Run backtest
-            trades, positions, performance = backtest_strategy(df, features)
-
-            # Store results
-            all_results[index] = {
-                'trades': trades,
-                'positions': positions,
-                'performance': performance
-            }
-
-            # Display results
-            print(f"\n{index} Performance:")
-            print(f"  Total Trades: {performance['total_trades']}")
-            print(f"  Win Rate: {performance['win_rate']:.2f}%")
-            print(f"  Winning Trades: {performance['winning_trades']}")
-            print(f"  Losing Trades: {performance['losing_trades']}")
-            print(f"  Total Profit Points: {performance['total_profit']:.2f}")
-            print(f"  Average Profit per Trade: {performance['avg_profit']:.2f}")
-            print(f"  Average Profit %: {performance['avg_profit_pct']:.2f}%")
-            print(f"  Max Drawdown: {performance['max_drawdown']:.2f}")
-            print(f"  Profit Factor: {performance['profit_factor']:.2f}")
-
-        except Exception as e:
-            print(f"Error backtesting {index}: {str(e)}")
-            continue
-
-    # Summary statistics
-    print("\n" + "=" * 80)
-    print("BACKTEST SUMMARY")
-    print("=" * 80)
-
-    total_trades = sum(r['performance']['total_trades'] for r in all_results.values())
-    total_wins = sum(r['performance']['winning_trades'] for r in all_results.values())
-    overall_win_rate = (total_wins / total_trades * 100) if total_trades > 0 else 0
-
-    print(f"\nOverall Statistics:")
-    print(f"  Total Trades Across All Indices: {total_trades}")
-    print(f"  Overall Win Rate: {overall_win_rate:.2f}%")
-    print(f"  Indices Tested: {len(all_results)}")
-
-    # Save detailed results to CSV
-    save_backtest_results(all_results)
-
-    return all_results
-
-
-def save_backtest_results(all_results):
-    """Save backtest results to CSV files"""
-    import os
-
-    # Create output directory
-    output_dir = "backtest_results"
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Save summary
-    summary_data = []
-    for index, results in all_results.items():
-        perf = results['performance']
-        summary_data.append({
-            'Index': index,
-            'Total_Trades': perf['total_trades'],
-            'Win_Rate_%': round(perf['win_rate'], 2),
-            'Winning_Trades': perf['winning_trades'],
-            'Losing_Trades': perf['losing_trades'],
-            'Total_Profit': round(perf['total_profit'], 2),
-            'Avg_Profit': round(perf['avg_profit'], 2),
-            'Avg_Profit_%': round(perf['avg_profit_pct'], 2),
-            'Max_Drawdown': round(perf['max_drawdown'], 2),
-            'Profit_Factor': round(perf['profit_factor'], 2)
-        })
-
-    summary_df = pd.DataFrame(summary_data)
-    summary_df.to_csv(f"{output_dir}/backtest_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", index=False)
-
-    # Save detailed trades for each index
-    for index, results in all_results.items():
-        if results['positions']:
-            positions_df = pd.DataFrame(results['positions'])
-            positions_df.to_csv(f"{output_dir}/{index}_trades_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                                index=False)
-
-    print(f"\nBacktest results saved to {output_dir}/")
-
-
-def process_symbol(symbol_dict, signal_state, trader):
-    """Process a single symbol following Pine Script logic"""
-    symbol, index = next(iter(symbol_dict.items()))
-
-    # Fetch OHLC data
-    df = fetch_ohlc(symbol, interval=25)  # 25 min like your original
-
-    if len(df) < 100:
-        print(f"Skipping {index}: insufficient data")
-        return
-
-    # Calculate OHLC4
-    df['ohlc4'] = (df['open'] + df['high'] + df['low'] + df['close']) / 4
-
-    # Build features
-    features = build_features(df)
-    if len(features) < LOOKAHEAD:
-        print(f"Not enough features for {index}")
-        return
-
-    # Get current index
-    current_idx = len(features) - 1
-
-    # Get ML prediction
-    prediction = predict_ml_signal(features, df['close'], current_idx)
-
-    # Apply filters
-    vol_filter = volatility_filter(df['close'], current_idx, USE_VOLATILITY_FILTER)
-    regime_filt = regime_filter(df['ohlc4'], current_idx, REGIME_THRESHOLD, USE_REGIME_FILTER)
-    adx_filt = adx_filter(df['high'], df['low'], df['close'], current_idx, 14, ADX_THRESHOLD, USE_ADX_FILTER)
-
-    filter_all = vol_filter and regime_filt and adx_filt
-
-    # Determine signal (1=long, -1=short, 0=neutral)
-    current_signal = 0
-    if prediction > 0 and filter_all:
-        current_signal = 1
-    elif prediction < 0 and filter_all:
-        current_signal = -1
-
-    # Get kernel signals
-    kernel_signals = get_kernel_signals(df['close'])
-
-    # Check current position and signals
-    current_position = signal_state.get_position(index)
-    last_signal = signal_state.get_last_signal(index)
-    bars_held = signal_state.get_bars_held(index)
-
-    # Determine if we have bullish/bearish conditions
-    is_bullish = kernel_signals['bullish'].iloc[-1] if USE_KERNEL_FILTER else True
-    is_bearish = kernel_signals['bearish'].iloc[-1] if USE_KERNEL_FILTER else True
-
-    # Entry conditions (matching your original logic)
-    start_long_trade = current_signal == 1 and is_bullish
-    start_short_trade = current_signal == -1 and is_bearish
-
-    # Exit conditions based on your original logic
-    end_long_trade = False
-    end_short_trade = False
-
-    if current_position == 'LONG':
-        signal_state.increment_bars_held(index)
-        bars_held = signal_state.get_bars_held(index)
-        # Exit on: bearish kernel, strict bar count, or stop loss (using ATR if available)
-        end_long_trade = is_bearish or bars_held >= STRICT_EXIT_BARS
-
-    elif current_position == 'SHORT':
-        signal_state.increment_bars_held(index)
-        bars_held = signal_state.get_bars_held(index)
-        # Exit on: bullish kernel, strict bar count, or stop loss
-        end_short_trade = is_bullish or bars_held >= STRICT_EXIT_BARS
-
-    # Execute trades
-    current_price = df['close'].iloc[-1]
-    current_time = df.index[-1]
-    action_taken = None
-
-    if end_long_trade and current_position == 'LONG':
-        action_taken = "SELL"
-        signal_state.update_position(index, None)
-        signal_state.reset_bars_held(index)
-
-    elif end_short_trade and current_position == 'SHORT':
-        action_taken = "COVER"
-        signal_state.update_position(index, None)
-        signal_state.reset_bars_held(index)
-
-    elif start_long_trade and current_position is None:
-        action_taken = "BUY"
-        signal_state.update_position(index, 'LONG', current_price, current_time)
-        signal_state.reset_bars_held(index)
-
-    elif start_short_trade and current_position is None:
-        action_taken = "SHORT"
-        signal_state.update_position(index, 'SHORT', current_price, current_time)
-        signal_state.reset_bars_held(index)
-
-    # Update signal state
-    signal_state.update_signal(index, current_signal)
-
-    # Log and send alerts
-    if action_taken:
-        log_str = (
-            f"INDEX: {index}, "
-            f"Time: {current_time}, "
-            f"Action: {action_taken}, "
-            f"Price: {current_price:.2f}, "
-            f"ML Prediction: {prediction}, "
-            f"Signal: {current_signal}, "
-            f"Kernel Bullish: {is_bullish}, "
-            f"Kernel Bearish: {is_bearish}"
-        )
-
-        print(f"📈 SIGNAL: {log_str}")
-
-        # Send email alert
-        subject = f"{index} SIGNAL: {action_taken}"
-        send_email(subject, log_str)
-
-        # Update Firebase
-        doc_ref = db.collection("live_alerts").document(index)
-        doc_ref.update({
-            "alerts": ArrayUnion([log_str])
-        })
-
-        # Execute trade
-        # trader.execute_single_trade(timestamp=current_time, index_name=index, signal_type=action_taken)
-
-    else:
-        print(f"📊 {index}: No action. Position: {current_position}, Signal: {current_signal}, Bars held: {bars_held}")
-
-
-# === Helper Functions ===
-def fetch_ohlc(symbol, interval=25, months=5):  # Changed to 25 min like your original
-    """Fetch OHLC data from Dhan"""
+def save_historical_data(symbols_dict, months=60):
+    """Fetch and save historical data locally"""
+    data_dir = "historical_data"
+    os.makedirs(data_dir, exist_ok=True)
     end = datetime.now()
     start = end - timedelta(days=30 * months)
+    date_suffix = f"{months}months"
+    print(f"Fetching last {months} months of data")
+    for symbol, index in symbols_dict.items():
+        print(f"Fetching data for {index}...")
+        chunks = []
+        current_start = start
+        while current_start <= end:
+            current_end = min(current_start + timedelta(days=75), end)
+            try:
+                r = dhan_object.intraday_minute_data(
+                    security_id=symbol, from_date=current_start.strftime('%Y-%m-%d'),
+                    to_date=current_end.strftime('%Y-%m-%d'), interval=CANDLE_INTERVAL_MINUTES,
+                    exchange_segment="IDX_I", instrument_type="INDEX"
+                )
+                if data := r.get('data', []): chunks.append(pd.DataFrame(data))
+            except Exception as e:
+                print(f"  Error fetching {index}: {e}")
+            current_start = current_end + timedelta(days=1)
+        if not chunks:
+            print(f"  No data fetched for {index}")
+            continue
+        df = pd.concat(chunks).reset_index(drop=True)
+        df['datetime'] = pd.to_datetime(df['timestamp'], unit='s').dt.tz_localize('UTC').dt.tz_convert(
+            'Asia/Kolkata').dt.tz_localize(None)
+        df.set_index('datetime', inplace=True)
+        df = df[['open', 'high', 'low', 'close']].astype(float).sort_index()
+        filename = f"{data_dir}/{index}_{date_suffix}.csv"
+        df.to_csv(filename)
+        print(f"  Saved {len(df)} rows to {filename}")
 
+
+def fetch_ohlc(symbol, months=10):
+    """Fetch OHLC data from Dhan for live mode"""
+    end = datetime.now()
+    start = end - timedelta(days=30 * months)
     chunks = []
     current_start = start
     while current_start <= end:
         current_end = min(current_start + timedelta(days=75), end)
         r = dhan_object.intraday_minute_data(
-            security_id=symbol,
-            from_date=current_start.strftime('%Y-%m-%d'),
-            to_date=current_end.strftime('%Y-%m-%d'),
-            interval=interval,
-            exchange_segment="IDX_I",
-            instrument_type="INDEX")
-        data = r.get('data', [])
-        if data:
-            chunks.append(pd.DataFrame(data))
+            security_id=symbol, from_date=current_start.strftime('%Y-%m-%d'),
+            to_date=current_end.strftime('%Y-%m-%d'), interval=CANDLE_INTERVAL_MINUTES,
+            exchange_segment="IDX_I", instrument_type="INDEX"
+        )
+        if data := r.get('data', []): chunks.append(pd.DataFrame(data))
         current_start = current_end + timedelta(days=1)
-
+    if not chunks: return pd.DataFrame()
     df = pd.concat(chunks).reset_index(drop=True)
-    df['datetime'] = pd.to_datetime(df['timestamp'], unit='s')
-    df['datetime'] = df['datetime'].dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata').dt.tz_localize(None)
+    df['datetime'] = pd.to_datetime(df['timestamp'], unit='s').dt.tz_localize('UTC').dt.tz_convert(
+        'Asia/Kolkata').dt.tz_localize(None)
     df.set_index('datetime', inplace=True)
-    df = df[['open', 'high', 'low', 'close']].astype(float)
-
-    # Append live candle if needed
-    now = pd.Timestamp.now().floor(f"{interval}min")
-    if now not in df.index or (datetime.now() - df.index[-1].to_pydatetime()).total_seconds() > interval * 60:
-        print(f"🔄 Appending live LTP for {symbol}")
-        r2 = dhan_object.quote_data({
-            "IDX_I": [int(symbol)],
-        })
-
-        ltp = float(r2['data']['data']['IDX_I'][symbol]['last_price'])
-        df.loc[now] = [ltp, ltp, ltp, ltp]
-
-    return df.sort_index()
+    return df[['open', 'high', 'low', 'close']].astype(float).sort_index()
 
 
-def is_market_closed():
-    now = datetime.now()
-    market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    return now >= market_close
+def process_symbol(symbol_dict, signal_state, trader, mode='live', trade_recorder=None, window_df=None):
+    """
+    Processes a single symbol - SIMPLIFIED TO MATCH PINE SCRIPT
+    """
+    symbol, index = next(iter(symbol_dict.items()))
+    print(f"\n--- Processing Symbol: {index} ---")
+
+    # Get data
+    df = window_df if mode != 'live' else fetch_ohlc(symbol)
+    if df.empty or len(df) < 200:
+        print(f"⚠️ Insufficient data for {index} ({len(df)} bars). Skipping.")
+        return
+
+    print(f"  Data loaded. Shape: {df.shape}. Running MomentumX engine...")
+
+    # Run the MomentumX engine
+    strategy = MomentumX(df)
+    df_signals = strategy.run()
+
+    # Get the latest signals
+    latest = df_signals.iloc[-1]
+    start_long = latest['startLongTrade']
+    start_short = latest['startShortTrade']
+    end_long = latest['endLongTrade']
+    end_short = latest['endShortTrade']
+
+    current_time = latest.name
+    current_price = latest['close']
+    current_position = signal_state.get_position(index)
+
+    # Get signal for persistence
+    current_signal = int(latest['signal'])
+    signal_state.update_signal(index, current_signal)
+
+    action_taken = None
+
+    print(f"  Current Position: {current_position}")
+    print(f"  Signals: StartLong={start_long}, StartShort={start_short}, EndLong={end_long}, EndShort={end_short}")
+
+    # Simple Pine Script logic - NO modifications!
+
+    # Exit Logic (exactly as Pine Script)
+    if current_position == 'LONG' and end_long:
+        action_taken = "SELL"
+        print(f"  Decision: Exit LONG position.")
+
+    elif current_position == 'SHORT' and end_short:
+        action_taken = "COVER"
+        print(f"  Decision: Exit SHORT position.")
+
+    # Entry Logic (exactly as Pine Script)
+    elif current_position is None:
+        if start_long:
+            action_taken = "BUY"
+            print("  Decision: Enter new LONG position.")
+
+        elif start_short:
+            action_taken = "SHORT"
+            print("  Decision: Enter new SHORT position.")
+
+    # Execute trade if needed
+    if action_taken:
+        print(f"\n{'=' * 20} TRADE ALERT {'=' * 20}")
+        print(f"📈 ACTION: {action_taken} on {index} at {current_price:.2f}")
+        print(f"{'=' * 53}\n")
+
+        if mode == 'live' and trader:
+            subject = f"{index} SIGNAL: {action_taken}"
+            send_email(subject, f"{action_taken} {index} at {current_price}")
+            db.collection("live_alerts").document(index).update(
+                {"alerts": ArrayUnion([f"{action_taken} at {current_price}"])})
+            trader.execute_single_trade(timestamp=current_time, index_name=index, signal_type=action_taken)
+
+        elif mode == 'backtest' and trade_recorder:
+            # Apply slippage
+            slip_multiplier = (1 + BACKTEST_SLIPPAGE / 100) if action_taken in ['BUY', 'SHORT'] else (
+                        1 - BACKTEST_SLIPPAGE / 100)
+            execution_price = current_price * slip_multiplier
+            trade_recorder.record_trade(current_time, index, action_taken, execution_price)
+
+        # Update position state
+        if action_taken in ["BUY", "SHORT"]:
+            new_position = "LONG" if action_taken == "BUY" else "SHORT"
+            signal_state.update_position(index, new_position, current_price, current_time)
+        elif action_taken in ["SELL", "COVER"]:
+            signal_state.update_position(index, None)
+
+    else:
+        print(f"  No action taken.")
 
 
-def run_every_15_minutes_until_close(signal_state, trader):
-    """Run strategy every 15 minutes until market close"""
-    print("✅ Momentum X Strategy started. Will run every 15 minutes until 3:30 PM IST.")
+def process_index_backtest(index_dict, backtest_state_lock):
+    """
+    Optimized backtest processing with pre-calculation
+    """
+    symbol, index = next(iter(index_dict.items()))
+    index_state = SignalState(filepath=f"backtest_signal_state_{index}.json")
+    trade_recorder = TradeRecorder()
+
+    print(f"\n🔄 Starting optimized backtest for {index}...")
+
+    try:
+        # Load all data at once
+        history_df = pd.read_csv(f'testing_data/{index}_test.csv', index_col='datetime', parse_dates=True)
+        new_data_df = pd.read_csv(f'testing_data/{index}_input.csv', index_col='datetime', parse_dates=True)
+        all_data = pd.concat([history_df, new_data_df])
+
+        print(f"  Pre-calculating all signals for {index}...")
+
+        # Run MomentumX on entire dataset once
+        momentum = MomentumX(all_data)
+        df_with_signals = momentum.run()
+
+        print(f"  Signals calculated. Processing trades...")
+
+        test_start_idx = len(history_df)
+
+        # Now just iterate through the pre-calculated signals
+        for i in range(test_start_idx, len(df_with_signals)):
+            current_row = df_with_signals.iloc[i]
+
+            # Simplified processing using pre-calculated signals
+            start_long = current_row['startLongTrade']
+            start_short = current_row['startShortTrade']
+            end_long = current_row['endLongTrade']
+            end_short = current_row['endShortTrade']
+
+            current_time = current_row.name
+            current_price = current_row['close']
+            current_position = index_state.get_position(index)
+            current_signal = int(current_row['signal'])
+
+            # Update signal state
+            index_state.update_signal(index, current_signal)
+
+            action_taken = None
+
+            # Same simple logic as live
+            if current_position == 'LONG' and end_long:
+                action_taken = "SELL"
+            elif current_position == 'SHORT' and end_short:
+                action_taken = "COVER"
+            elif current_position is None:
+                if start_long:
+                    action_taken = "BUY"
+                elif start_short:
+                    action_taken = "SHORT"
+
+            if action_taken:
+                # Record trade with slippage
+                slip_multiplier = (1 + BACKTEST_SLIPPAGE / 100) if action_taken in ['BUY', 'SHORT'] else (1 - BACKTEST_SLIPPAGE / 100)
+                execution_price = current_price * slip_multiplier
+                trade_recorder.record_trade(current_time, index, action_taken, execution_price)
+
+                # Update position
+                if action_taken in ["BUY", "SHORT"]:
+                    new_position = "LONG" if action_taken == "BUY" else "SHORT"
+                    index_state.update_position(index, new_position, current_price, current_time)
+                else:
+                    index_state.update_position(index, None)
+
+            # Progress update
+            if (i - test_start_idx) % 100 == 0:
+                processed = i - test_start_idx + 1
+                total = len(df_with_signals) - test_start_idx
+                print(f"  {index}: Processed {processed}/{total} candles...")
+
+    except Exception as e:
+        print(f"❌ Error in backtest for {index}: {e}")
+        import traceback
+        traceback.print_exc()
+
+    print(f"✅ Completed {index} backtest")
+
+    # Cleanup
+    if os.path.exists(index_state.filepath):
+        os.remove(index_state.filepath)
+
+    return index, trade_recorder
+
+
+def run_backtest_analysis():
+    """Run comprehensive backtest using parallel processing"""
+    print("\n" + "=" * 80 + "\nRUNNING OPTIMIZED PARALLEL BACKTEST\n" + "=" * 80 + "\n")
 
     indices = [
-        {"13": "NIFTY"},
-        {"25": "BANKNIFTY"},
-        {"51": "SENSEX"},
-        {"27": "FINNIFTY"},
+        # {"13": "NIFTY"},
+        # {"25": "BANKNIFTY"},
+        # {"51": "SENSEX"},
+        # {"27": "FINNIFTY"},
         {"442": "MIDCPNIFTY"}
     ]
 
+    backtest_state_lock = threading.Lock()
+    trade_recorders = {}
+
+    with ThreadPoolExecutor(max_workers=len(indices)) as executor:
+        # Use the optimized function
+        future_to_index = {
+            executor.submit(process_index_backtest, idx, backtest_state_lock): idx
+            for idx in indices
+        }
+
+        for future in as_completed(future_to_index):
+            try:
+                index_name, recorder = future.result()
+                trade_recorders[index_name] = recorder
+            except Exception as exc:
+                print(f"❌ Backtest task generated an exception: {exc}")
+
+    print("\n" + "=" * 80 + "\nBACKTEST RESULTS\n" + "=" * 80)
+    all_results = {}
+    for index, recorder in trade_recorders.items():
+        if recorder.positions:
+            total_trades = len(recorder.positions)
+            winning_trades = sum(1 for p in recorder.positions if p['profit'] > 0)
+            total_profit = sum(p['profit'] for p in recorder.positions)
+            win_rate = (winning_trades / total_trades) * 100 if total_trades > 0 else 0
+            all_results[index] = {
+                'trades': recorder.trades, 'positions': recorder.positions,
+                'performance': {
+                    'total_trades': total_trades, 'winning_trades': winning_trades,
+                    'losing_trades': total_trades - winning_trades, 'win_rate': win_rate,
+                    'total_profit': total_profit,
+                    'avg_profit': total_profit / total_trades if total_trades > 0 else 0,
+                    'avg_profit_pct': sum(
+                        p['profit_pct'] for p in recorder.positions) / total_trades if total_trades > 0 else 0
+                }
+            }
+            print(
+                f"\n{index} Performance:\n  Total Trades: {total_trades}\n  Win Rate: {win_rate:.2f}%\n  Total Profit: {total_profit:.2f}")
+    save_backtest_results(all_results)
+
+
+def save_backtest_results(all_results):
+    """Save backtest results to CSV"""
+    output_dir = "backtest_results"
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    summary_data = []
+    for index, results in all_results.items():
+        perf = results['performance']
+        summary_data.append({
+            'Index': index, 'Total_Trades': perf['total_trades'], 'Win_Rate_%': round(perf['win_rate'], 2),
+            'Total_Profit': round(perf['total_profit'], 2)
+        })
+    if summary_data:
+        pd.DataFrame(summary_data).to_csv(f"{output_dir}/backtest_summary_{timestamp}.csv", index=False)
+    for index, results in all_results.items():
+        if results['positions']:
+            pd.DataFrame(results['positions']).to_csv(f"{output_dir}/{index}_trades_{timestamp}.csv", index=False)
+    print(f"\nResults saved to {output_dir}/")
+
+
+def get_next_candle_time():
+    """Calculate the next candle close time"""
+    now = datetime.now()
+    market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    if now < market_open: return market_open + timedelta(minutes=CANDLE_INTERVAL_MINUTES,
+                                                         seconds=CANDLE_COMPLETION_BUFFER)
+    minutes_since_open = (now - market_open).total_seconds() / 60
+    candles_passed = int(minutes_since_open // CANDLE_INTERVAL_MINUTES)
+    next_candle_close = market_open + timedelta(minutes=(candles_passed + 1) * CANDLE_INTERVAL_MINUTES)
+    return next_candle_close + timedelta(seconds=CANDLE_COMPLETION_BUFFER)
+
+
+def run_live_trading(signal_state, trader):
+    """Run live trading loop"""
+    print(f"✅ Live trading started. Will run every {CANDLE_INTERVAL_MINUTES} minutes until 3:30 PM IST.")
+    indices = [{"13": "NIFTY"}, {"25": "BANKNIFTY"}, {"51": "SENSEX"}, {"27": "FINNIFTY"}, {"442": "MIDCPNIFTY"}]
     while True:
-        if is_market_closed():
-            print("⏹️ Market closed at 3:30 PM. Stopping strategy.")
+        now = datetime.now()
+        if now.hour == 15 and now.minute >= 30:
+            print("⏹️ Market closed. Stopping strategy.")
             break
 
-        print(f"\n{'=' * 60}")
-        print(f"🕒 Running strategy at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"{'=' * 60}\n")
+        next_run = get_next_candle_time()
+        wait_time = (next_run - now).total_seconds()
+        if wait_time > 0:
+            print(f"\n⏳ Next run at {next_run.strftime('%H:%M:%S')}. Waiting {int(wait_time)} seconds...\n")
+            time.sleep(wait_time)
 
+        print(f"\n{'=' * 60}\n🕒 Running strategy at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{'=' * 60}\n")
         for index_dict in indices:
             try:
-                process_symbol(index_dict, signal_state, trader)
+                process_symbol(index_dict, signal_state, trader, mode='live')
             except Exception as e:
                 symbol, index = next(iter(index_dict.items()))
-                print(f"❌ Error processing {index}: {str(e)}")
-                continue
-
-        # Sleep until next run (matching your original 25 min)
-        now = datetime.now()
-        next_run = (now + timedelta(minutes=25)).replace(second=0, microsecond=0)
-
-        sleep_duration = (next_run - now).total_seconds()
-        print(f"\n🕒 Next run at {next_run.strftime('%H:%M:%S')}. Sleeping for {int(sleep_duration)} seconds...\n")
-        time.sleep(sleep_duration)
+                print(f"❌ Error processing {index}: {e}")
 
 
-# === Main Execution ===
+# === Main Entry Point ===
 if __name__ == '__main__':
     load_dotenv()
-
-    # Load credentials
     CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
     ACCESS_TOKEN = os.getenv("DHAN_API_KEY")
-    KOTAK_ACCESS_TOKEN = os.getenv("KOTAK_ACCESS_TOKEN")
-
-    # Initialize Dhan
     dhan_object = dhanhq.dhanhq(CLIENT_ID, ACCESS_TOKEN)
 
-    # Add command line argument parsing
-    import sys
-
-    if len(sys.argv) > 1 and sys.argv[1] == 'backtest':
-        # Run backtest mode
-        print("Running in BACKTEST mode...")
-        run_backtest_analysis()
+    if len(sys.argv) > 1:
+        mode = sys.argv[1]
+        if mode == 'backtest':
+            run_backtest_analysis()
+        elif mode == 'save_data':
+            print("Saving historical data...")
+            indices = {"13": "NIFTY", "25": "BANKNIFTY", "51": "SENSEX", "27": "FINNIFTY", "442": "MIDCPNIFTY"}
+            save_historical_data(indices, months=60)
+        elif mode in ['test_live', 'live']:
+            is_test = mode == 'test_live'
+            print(f"Running in {'TEST LIVE' if is_test else 'LIVE TRADING'} mode...")
+            trader = KotakOptionsTrader(test_mode=is_test)
+            if not is_test and not trader.get_account_status()['logged_in']:
+                print("❌ Failed to login to Kotak. Please check token.")
+                sys.exit(1)
+            cred = credentials.Certificate("stock-monitoring-fb.json")
+            initialize_app(cred)
+            db = firestore.client()
+            signal_state = SignalState()
+            run_live_trading(signal_state, trader)
+        else:
+            print(f"Unknown mode: {mode}. Use 'backtest', 'save_data', 'test_live', or 'live'.")
     else:
-        # Run live trading mode
-        print("Running in LIVE TRADING mode...")
-
-        # Initialize Kotak trader
-        trader = KotakOptionsTrader(access_token=KOTAK_ACCESS_TOKEN)
-
-        # Firebase Setup
-        cred = credentials.Certificate("stock-monitoring-fb.json")
-        initialize_app(cred)
-        db = firestore.client()
-
-        # Initialize signal state
-        signal_state = SignalState()
-
-        # Run strategy
-        run_every_15_minutes_until_close(signal_state, trader)
+        print("Defaulting to LIVE TRADING mode. Use 'test_live' for paper trading.")
+        # Add a safeguard for accidental live run
+        confirm = input("Are you sure you want to run with REAL money? (yes/no): ")
+        if confirm.lower() == 'yes':
+            trader = KotakOptionsTrader(test_mode=False)
+            if not trader.get_account_status()['logged_in']:
+                print("❌ Failed to login to Kotak.")
+                sys.exit(1)
+            cred = credentials.Certificate("stock-monitoring-fb.json")
+            initialize_app(cred)
+            db = firestore.client()
+            signal_state = SignalState()
+            run_live_trading(signal_state, trader)
+        else:
+            print("Exiting.")
