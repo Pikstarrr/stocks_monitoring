@@ -10,3 +10,4 @@ firebase-admin~=6.9.0
 google~=3.0.0
 protobuf~=6.31.1
 numba~=0.60.0
+tqdm~=4.67.1

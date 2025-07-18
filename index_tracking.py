@@ -4,8 +4,8 @@ import json
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
+from multiprocessing import Pool
 
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -14,6 +14,7 @@ import pandas as pd
 from dotenv import load_dotenv
 from google.cloud.firestore_v1 import ArrayUnion
 from numba import jit, njit
+from tqdm import tqdm  # For progress bars (install with pip install tqdm)
 
 import dhanhq
 from send_mail import send_email
@@ -27,7 +28,7 @@ FEATURE_CONFIG = [
     ("WT", 10, 11),  # Feature 2
     ("CCI", 20, 1),  # Feature 3
     ("ADX", 20, 2),  # Feature 4
-    ("RSI", 9, 1),  # Feature 5
+    ("RSI", 9, 1),   # Feature 5
 ]
 
 NEIGHBOR_COUNT = 8
@@ -62,10 +63,8 @@ SIGNAL_STATE_FILE = "signal_state.json"
 # Logging flag for detailed output
 DEBUG = True
 
-
 class SignalState:
     """Manages signal persistence across runs"""
-
     def __init__(self, filepath=SIGNAL_STATE_FILE):
         self.filepath = filepath
         self.state = self.load_state()
@@ -123,10 +122,8 @@ class SignalState:
         self.state[symbol]['bars_held'] = 0
         self.save_state()
 
-
 class TradeRecorder:
     """Records trades during backtest"""
-
     def __init__(self):
         self.trades = []
         self.positions = []
@@ -160,7 +157,6 @@ class TradeRecorder:
                 })
                 self.current_position = None
 
-
 # === Optimized Feature and Indicator Calculations ===
 
 @njit
@@ -174,7 +170,6 @@ def incremental_compute_rsi(prices, period):
     avg_down = np.mean(down[-period:])
     rs = avg_up / avg_down if avg_down != 0 else 0
     return 100 - 100 / (1 + rs)
-
 
 def build_features_incremental(df, prev_features=None):
     """Build features incrementally"""
@@ -196,7 +191,6 @@ def build_features_incremental(df, prev_features=None):
             new_row[f"{kind}_{param_a}_{param_b}"] = new_val
         return pd.concat([prev_features, new_row])
 
-
 @njit
 def calculate_adx(high, low, close, period=14):
     if len(high) < period * 2:
@@ -215,7 +209,7 @@ def calculate_adx(high, low, close, period=14):
         res = np.zeros_like(arr, dtype=np.float64)
         res[0] = arr[0]
         for i in range(1, len(arr)):
-            res[i] = alpha * arr[i] + (1 - alpha) * res[i - 1]
+            res[i] = alpha * arr[i] + (1 - alpha) * res[i-1]
         return res
 
     atr = rma(tr, period)
@@ -226,19 +220,17 @@ def calculate_adx(high, low, close, period=14):
     pad = np.zeros(1, dtype=np.float64)
     return np.concatenate((pad, adx))
 
-
 @njit
 def calculate_atr(high, low, close, period=14):
     if len(high) < period + 1:
         return np.zeros(len(high), dtype=np.float64)
     tr = np.maximum(high - low, np.maximum(np.abs(high - np.roll(close, 1)), np.abs(low - np.roll(close, 1))))[1:]
     atr = np.zeros(len(tr), dtype=np.float64)
-    atr[period - 1] = np.mean(tr[:period])
+    atr[period-1] = np.mean(tr[:period])
     for i in range(period, len(tr)):
-        atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
+        atr[i] = (atr[i-1] * (period - 1) + tr[i]) / period
     pad = np.zeros(len(high) - len(atr), dtype=np.float64)
     return np.concatenate((pad, atr))
-
 
 def get_kernel_signals(series, h=KERNEL_H, r=KERNEL_R, x=KERNEL_X, lag=KERNEL_LAG):
     yhat1 = rational_quadratic_kernel(series, h, r, x)
@@ -248,8 +240,7 @@ def get_kernel_signals(series, h=KERNEL_H, r=KERNEL_R, x=KERNEL_X, lag=KERNEL_LA
         bearish = yhat2 <= yhat1
     else:
         if len(yhat1) < 3:
-            return pd.Series([False] * len(series), index=series.index), pd.Series([False] * len(series),
-                                                                                   index=series.index), yhat1, yhat2
+            return pd.Series([False] * len(series), index=series.index), pd.Series([False] * len(series), index=series.index), yhat1, yhat2
         wasBearishRate = yhat1.shift(2) > yhat1.shift(1)
         wasBullishRate = yhat1.shift(2) < yhat1.shift(1)
         isBearishRate = yhat1.shift(1) > yhat1
@@ -258,25 +249,24 @@ def get_kernel_signals(series, h=KERNEL_H, r=KERNEL_R, x=KERNEL_X, lag=KERNEL_LA
         bearish = isBearishRate & wasBullishRate
     return bullish, bearish, yhat1, yhat2
 
-
 def calculate_volatility_filter(close, use_filter=True):
     if not use_filter:
         return True
+    close = pd.Series(close)
     df_temp = pd.DataFrame({'high': close, 'low': close, 'close': close})
     recent_atr = calculate_atr(df_temp['high'].values, df_temp['low'].values, df_temp['close'].values, period=1)[-1]
-    historical_atr = calculate_atr(df_temp['high'].values, df_temp['low'].values, df_temp['close'].values, period=10)[
-        -1]
+    historical_atr = calculate_atr(df_temp['high'].values, df_temp['low'].values, df_temp['close'].values, period=10)[-1]
     return recent_atr > historical_atr
-
 
 def calculate_regime_filter(close, threshold=REGIME_THRESHOLD, use_filter=True):
     if not use_filter:
         return True
+    close = pd.Series(close)
     lookback = 50
     if len(close) < lookback:
         return True
     x = np.arange(lookback)
-    y = close.iloc[-lookback:].values
+    y = close[-lookback:]
     y_mean = np.mean(y)
     if y_mean != 0:
         y_normalized = (y - y_mean) / y_mean
@@ -285,44 +275,44 @@ def calculate_regime_filter(close, threshold=REGIME_THRESHOLD, use_filter=True):
     slope = np.polyfit(x, y_normalized, 1)[0]
     return slope > threshold
 
-
-def check_dynamic_exit_conditions(df, position, bars_held):
+def check_dynamic_exit_conditions(high, low, close, position, bars_held):
     if not USE_DYNAMIC_EXITS:
         return False
-    if len(df) < 10:
+    if len(close) < 10:
         return False
-    current_idx = len(df) - 1
-    _, _, yhat1, yhat2 = get_kernel_signals(df['close'])
-    momentum = df['close'].pct_change(5).iloc[-1]
+    close = pd.Series(close)
+    high = pd.Series(high)
+    low = pd.Series(low)
+    current_idx = len(close) - 1
+    _, _, yhat1, yhat2 = get_kernel_signals(close)
+    momentum = close.pct_change(5).iloc[-1]
     if USE_KERNEL_SMOOTHING:
         if position == 'LONG':
-            bearish_cross = (
-                        yhat2.iloc[current_idx] < yhat1.iloc[current_idx] and yhat2.iloc[current_idx - 1] >= yhat1.iloc[
-                    current_idx - 1])
+            bearish_cross = (yhat2.iloc[current_idx] < yhat1.iloc[current_idx] and yhat2.iloc[current_idx - 1] >= yhat1.iloc[current_idx - 1])
             momentum_exit = momentum < -0.002
             return (bearish_cross or momentum_exit) and bars_held > 0
         elif position == 'SHORT':
-            bullish_cross = (
-                        yhat2.iloc[current_idx] > yhat1.iloc[current_idx] and yhat2.iloc[current_idx - 1] <= yhat1.iloc[
-                    current_idx - 1])
+            bullish_cross = (yhat2.iloc[current_idx] > yhat1.iloc[current_idx] and yhat2.iloc[current_idx - 1] <= yhat1.iloc[current_idx - 1])
             momentum_exit = momentum > 0.002
             return (bullish_cross or momentum_exit) and bars_held > 0
     return False
 
-
-def calculate_entry_quality(df, signal_type):
-    recent_moves = df['close'].pct_change().iloc[-10:].abs()
+def calculate_entry_quality(high, low, close, signal_type):
+    close = pd.Series(close)
+    high = pd.Series(high)
+    low = pd.Series(low)
+    recent_moves = close.pct_change().iloc[-10:].abs()
     avg_move = recent_moves.mean() * 100
     has_volatility = avg_move >= 0.05
-    momentum_1 = (df['close'].iloc[-1] - df['close'].iloc[-2]) / df['close'].iloc[-2] * 100 if len(df) >= 2 else 0
-    momentum_3 = (df['close'].iloc[-1] - df['close'].iloc[-4]) / df['close'].iloc[-4] * 100 if len(df) >= 4 else 0
+    momentum_1 = (close.iloc[-1] - close.iloc[-2]) / close.iloc[-2] * 100 if len(close) >= 2 else 0
+    momentum_3 = (close.iloc[-1] - close.iloc[-4]) / close.iloc[-4] * 100 if len(close) >= 4 else 0
     if signal_type == 'LONG':
         momentum_aligned = momentum_1 > 0 and momentum_3 > 0.05
     else:
         momentum_aligned = momentum_1 < 0 and momentum_3 < -0.05
-    recent_ranges = ((df['high'] - df['low']) / df['low'] * 100).iloc[-5:]
+    recent_ranges = ((high - low) / low * 100).iloc[-5:]
     can_move = recent_ranges.max() >= 0.15 if not recent_ranges.empty else False
-    _, _, yhat1, _ = get_kernel_signals(df['close'])
+    _, _, yhat1, _ = get_kernel_signals(close)
     if len(yhat1) >= 3:
         kernel_accel = yhat1.iloc[-1] - yhat1.iloc[-3]
         kernel_accelerating = kernel_accel > 0 if signal_type == 'LONG' else kernel_accel < 0
@@ -330,15 +320,15 @@ def calculate_entry_quality(df, signal_type):
         kernel_accelerating = True
     return has_volatility and momentum_aligned and can_move and kernel_accelerating
 
-
-def calculate_market_structure(df):
-    if len(df) < 200:
+def calculate_market_structure(close):
+    close = pd.Series(close)
+    if len(close) < 200:
         return 'NEUTRAL'
-    sma20 = df['close'].rolling(20).mean()
-    sma50 = df['close'].rolling(50).mean()
-    sma200 = df['close'].rolling(200).mean()
-    bullish_structure = (df['close'].iloc[-1] > sma20.iloc[-1] > sma50.iloc[-1] > sma200.iloc[-1])
-    bearish_structure = (df['close'].iloc[-1] < sma20.iloc[-1] < sma50.iloc[-1] < sma200.iloc[-1])
+    sma20 = close.rolling(20).mean()
+    sma50 = close.rolling(50).mean()
+    sma200 = close.rolling(200).mean()
+    bullish_structure = (close.iloc[-1] > sma20.iloc[-1] > sma50.iloc[-1] > sma200.iloc[-1])
+    bearish_structure = (close.iloc[-1] < sma20.iloc[-1] < sma50.iloc[-1] < sma200.iloc[-1])
     if bullish_structure:
         ma_spread = (sma20.iloc[-1] - sma200.iloc[-1]) / sma200.iloc[-1] * 100
         return 'STRONG_BULLISH' if ma_spread > 0.5 else 'BULLISH'
@@ -346,7 +336,6 @@ def calculate_market_structure(df):
         ma_spread = (sma200.iloc[-1] - sma20.iloc[-1]) / sma200.iloc[-1] * 100
         return 'STRONG_BEARISH' if ma_spread > 0.5 else 'BEARISH'
     return 'NEUTRAL'
-
 
 # === Optimized Prediction Logic ===
 
@@ -381,11 +370,9 @@ def process_single_prediction_pine(X, Y, i, max_lookback, neighbor_count):
             lastDistance = distances[int(neighbor_count * 3 / 4)]
     return np.sum(votes[:count]), count
 
-
 @jit(nopython=True)
 def predict_labels(X, close, lookahead=LOOKAHEAD, neighbor_count=NEIGHBOR_COUNT, max_bars_back=MAX_BARS_BACK,
-                   label_threshold=LABEL_THRESHOLD, confidence_threshold=CONFIDENCE_THRESHOLD,
-                   lucky_number=LUCKY_NUMBER):
+                   label_threshold=LABEL_THRESHOLD, confidence_threshold=CONFIDENCE_THRESHOLD, lucky_number=LUCKY_NUMBER):
     n = len(X)
     Y = np.zeros(n, dtype=np.int32)
     for i in range(n - lookahead):
@@ -407,12 +394,9 @@ def predict_labels(X, close, lookahead=LOOKAHEAD, neighbor_count=NEIGHBOR_COUNT,
                 predictions[i] = int(np.sign(vote_sum))
     return predictions
 
-
 @jit(nopython=True)
-def predict_labels_single(X, close, current_idx, lookahead=LOOKAHEAD, neighbor_count=NEIGHBOR_COUNT,
-                          max_bars_back=MAX_BARS_BACK,
-                          label_threshold=LABEL_THRESHOLD, confidence_threshold=CONFIDENCE_THRESHOLD,
-                          lucky_number=LUCKY_NUMBER):
+def predict_labels_single(X, close, current_idx, lookahead=LOOKAHEAD, neighbor_count=NEIGHBOR_COUNT, max_bars_back=MAX_BARS_BACK,
+                          label_threshold=LABEL_THRESHOLD, confidence_threshold=CONFIDENCE_THRESHOLD, lucky_number=LUCKY_NUMBER):
     n = len(X)
     Y = np.zeros(n, dtype=np.int32)
     for i in range(n - lookahead):
@@ -433,11 +417,30 @@ def predict_labels_single(X, close, current_idx, lookahead=LOOKAHEAD, neighbor_c
             return int(np.sign(vote_sum))
     return 0
 
+# Precompute function for all indicators
+def precompute_all(df):
+    features = build_features_incremental(df)
+    atr = calculate_atr(df['high'].values, df['low'].values, df['close'].values)
+    bullish, bearish, _, _ = get_kernel_signals(df['close'])
+    adx = calculate_adx(df['high'].values, df['low'].values, df['close'].values) if USE_ADX_FILTER else np.zeros(len(df))
+    ema = df['close'].ewm(span=EMA_PERIOD, adjust=False).mean().values if USE_EMA_FILTER else np.full(len(df), np.inf)
+    sma = df['close'].rolling(window=SMA_PERIOD).mean().values if USE_SMA_FILTER else np.full(len(df), np.inf)
+    return {
+        'features': features.values,  # Convert to NumPy for faster slicing
+        'close': df['close'].values,
+        'high': df['high'].values,
+        'low': df['low'].values,
+        'bullish': bullish.values,
+        'bearish': bearish.values,
+        'atr': atr,
+        'adx': adx,
+        'ema': ema,
+        'sma': sma
+    }
 
 # === Processing Logic (Unified for Live and Backtest) ===
 
-def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='live', trade_recorder=None, df=None,
-                   prev_features=None, precalc_data=None):
+def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='live', trade_recorder=None, df=None, prev_features=None, precalc_data=None):
     symbol, index = next(iter(symbol_dict.items()))
     if mode == 'live':
         if DEBUG:
@@ -454,7 +457,8 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
     else:
         if DEBUG:
             print(f"[BACKTEST] Processing candle for {index}...")
-        pass  # df is passed in backtest
+        # In backtest, df is the simulated incremental DataFrame
+        pass
 
     if len(df) > MAX_BARS_BACK:
         df = df.iloc[-MAX_BARS_BACK:]
@@ -464,8 +468,14 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
         current_signal = precalc_data['prediction']
         current_bullish = precalc_data['bullish']
         current_bearish = precalc_data['bearish']
-        atr = precalc_data['atr']  # Full series, but we use [-1]
+        atr = precalc_data['atr']
         current_atr = atr[-1] if len(atr) > 0 else 0
+        adx = precalc_data['adx'][-1] if USE_ADX_FILTER else 0
+        ema = precalc_data['ema'][-1] if USE_EMA_FILTER else np.inf
+        sma = precalc_data['sma'][-1] if USE_SMA_FILTER else np.inf
+        high = precalc_data['high']
+        low = precalc_data['low']
+        close = precalc_data['close']
         if DEBUG:
             print(f"[BACKTEST] Using precalculated data for {index}")
     else:
@@ -481,37 +491,31 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
         current_bearish = bearish.iloc[-1]
         atr = calculate_atr(df['high'].values, df['low'].values, df['close'].values)
         current_atr = atr[-1] if len(atr) > 0 else 0
+        adx = calculate_adx(df['high'].values, df['low'].values, df['close'].values)[-1] if USE_ADX_FILTER else 0
+        ema = df['close'].ewm(span=EMA_PERIOD, adjust=False).mean().iloc[-1] if USE_EMA_FILTER else np.inf
+        sma = df['close'].rolling(window=SMA_PERIOD).mean().iloc[-1] if USE_SMA_FILTER else np.inf
+        high = df['high'].values
+        low = df['low'].values
+        close = df['close'].values
         if DEBUG:
             print(f"[INFO] Computed fresh data for {index}")
 
     current_time = df.index[-1]
-    current_price = df['close'].iloc[-1]
+    current_price = close[-1]
 
     current_position = signal_state.get_position(index)
     bars_held = signal_state.get_bars_held(index)
 
-    current_vol_filter = calculate_volatility_filter(df['close'], USE_VOLATILITY_FILTER)
-    current_regime_filter = calculate_regime_filter(df['close'], REGIME_THRESHOLD, USE_REGIME_FILTER)
+    current_vol_filter = calculate_volatility_filter(close, USE_VOLATILITY_FILTER)
+    current_regime_filter = calculate_regime_filter(close, REGIME_THRESHOLD, USE_REGIME_FILTER)
 
-    if USE_ADX_FILTER:
-        adx = calculate_adx(df['high'].values, df['low'].values, df['close'].values, period=14)
-        current_adx_filter = adx[-1] > ADX_THRESHOLD
-    else:
-        current_adx_filter = True
+    current_adx_filter = adx > ADX_THRESHOLD if USE_ADX_FILTER else True
 
-    if USE_EMA_FILTER:
-        ema = df['close'].ewm(span=EMA_PERIOD, adjust=False).mean()
-        ema_uptrend = current_price > ema.iloc[-1]
-        ema_downtrend = current_price < ema.iloc[-1]
-    else:
-        ema_uptrend = ema_downtrend = True
+    ema_uptrend = current_price > ema if USE_EMA_FILTER else True
+    ema_downtrend = current_price < ema if USE_EMA_FILTER else True
 
-    if USE_SMA_FILTER:
-        sma = df['close'].rolling(window=SMA_PERIOD).mean()
-        sma_uptrend = current_price > sma.iloc[-1]
-        sma_downtrend = current_price < sma.iloc[-1]
-    else:
-        sma_uptrend = sma_downtrend = True
+    sma_uptrend = current_price > sma if USE_SMA_FILTER else True
+    sma_downtrend = current_price < sma if USE_SMA_FILTER else True
 
     all_filters = current_vol_filter and current_regime_filter and current_adx_filter
     long_filters = all_filters and ema_uptrend and sma_uptrend
@@ -535,7 +539,7 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
         profit_target_hit = profit_pct >= 0.1
         strict_exit = bars_held >= STRICT_EXIT_BARS
         opposite_signal = persisted_signal == -1 and current_bearish and short_filters
-        dynamic_exit = check_dynamic_exit_conditions(df, 'LONG', bars_held)
+        dynamic_exit = check_dynamic_exit_conditions(high, low, close, 'LONG', bars_held)
         if profit_target_hit or strict_exit or opposite_signal or dynamic_exit:
             action_taken = "SELL"
             signal_state.update_position(index, None)
@@ -551,7 +555,7 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
         profit_target_hit = profit_pct >= 0.1
         strict_exit = bars_held >= STRICT_EXIT_BARS
         opposite_signal = persisted_signal == 1 and current_bullish and long_filters
-        dynamic_exit = check_dynamic_exit_conditions(df, 'SHORT', bars_held)
+        dynamic_exit = check_dynamic_exit_conditions(high, low, close, 'SHORT', bars_held)
         if profit_target_hit or strict_exit or opposite_signal or dynamic_exit:
             action_taken = "COVER"
             signal_state.update_position(index, None)
@@ -560,9 +564,9 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
                 print(f"[TRADE] Exiting SHORT for {index}: {action_taken}")
 
     if current_position is None:
-        market_structure = calculate_market_structure(df)
-        long_quality = calculate_entry_quality(df, 'LONG')
-        short_quality = calculate_entry_quality(df, 'SHORT')
+        market_structure = calculate_market_structure(close)
+        long_quality = calculate_entry_quality(high, low, close, 'LONG')
+        short_quality = calculate_entry_quality(high, low, close, 'SHORT')
         can_go_long = market_structure in ['BULLISH', 'STRONG_BULLISH']
         can_go_short = market_structure in ['BEARISH', 'STRONG_BEARISH']
         if persisted_signal == 1 and current_bullish and long_filters and long_quality and can_go_long:
@@ -596,7 +600,6 @@ def process_symbol(symbol_dict, signal_state, trader, quote_data=None, mode='liv
 
     return features  # Return for incremental use
 
-
 # === Optimized Backtest ===
 
 def run_backtest_analysis():
@@ -613,14 +616,9 @@ def run_backtest_analysis():
     ]
 
     all_results = {}
-    with ThreadPoolExecutor(max_workers=len(indices)) as executor:
-        future_to_index = {}
-        for idx in indices:
-            future = executor.submit(process_index_backtest, idx)
-            future_to_index[future] = idx
-
-        for future in as_completed(future_to_index):
-            index_name, recorder = future.result()
+    with Pool(processes=len(indices)) as pool:
+        results = pool.map(process_index_backtest, indices)
+        for index_name, recorder in results:
             if recorder.positions:
                 total_trades = len(recorder.positions)
                 winning_trades = sum(1 for p in recorder.positions if p['profit'] > 0)
@@ -634,8 +632,7 @@ def run_backtest_analysis():
                         'win_rate': win_rate,
                         'total_profit': total_profit,
                         'avg_profit': total_profit / total_trades if total_trades > 0 else 0,
-                        'avg_profit_pct': sum(
-                            p['profit_pct'] for p in recorder.positions) / total_trades if total_trades > 0 else 0
+                        'avg_profit_pct': sum(p['profit_pct'] for p in recorder.positions) / total_trades if total_trades > 0 else 0
                     }
                 }
                 print(f"\n{index_name} Performance:")
@@ -646,55 +643,50 @@ def run_backtest_analysis():
     save_backtest_results(all_results)
     return all_results
 
-
 def process_index_backtest(idx):
     symbol, index_name = next(iter(idx.items()))
     backtest_state = SignalState(filepath=f"backtest_signal_state_{index_name}.json")
     trade_recorder = TradeRecorder()
 
-    if DEBUG:
-        print(f"[BACKTEST] Starting backtest for {index_name}...")
+    print(f"[BACKTEST] Starting backtest for {index_name}...")
 
-    # Preload full dataset
-    input_path = f'testing_data/{index_name}_input.csv'
-    test_path = f'testing_data/{index_name}_test.csv'
-    full_df = pd.read_csv(input_path, parse_dates=['datetime'], index_col='datetime')
-    test_df = pd.read_csv(test_path, parse_dates=['datetime'], index_col='datetime')
-    full_df = pd.concat([full_df, test_df]).sort_index()
+    # Preload full dataset - SWAP: test as base/history, input as simulation
+    history_path = f'testing_data/{index_name}_test.csv'  # Now history (base ~6000)
+    simulation_path = f'testing_data/{index_name}_input.csv'  # Now simulation (~15000, added 1 by 1)
+    history_df = pd.read_csv(history_path, parse_dates=['datetime'], index_col='datetime')
+    simulation_df = pd.read_csv(simulation_path, parse_dates=['datetime'], index_col='datetime')
+    full_df = pd.concat([history_df, simulation_df]).sort_index()
 
     # Precompute everything possible once
-    if DEBUG:
-        print(f"[BACKTEST] Precomputing features and indicators for {index_name}...")
-    full_features = build_features_incremental(full_df)  # Full features
-    full_atr = calculate_atr(full_df['high'].values, full_df['low'].values, full_df['close'].values)
-    full_bullish, full_bearish, _, _ = get_kernel_signals(full_df['close'])
+    print(f"[BACKTEST] Precomputing features and indicators for {index_name}...")
+    precomp = precompute_all(full_df)
 
-    # Simulate incremental backtest with slicing
-    test_start = len(full_df) - len(test_df)
-    for i in range(max(test_start, LOOKAHEAD), len(full_df)):
+    # Simulate incremental backtest with slicing over simulation (input.csv) candles
+    simulation_start = len(full_df) - len(simulation_df)  # End of history_df (~6000)
+    progress = tqdm(range(max(simulation_start, LOOKAHEAD), len(full_df)), desc=f"Processing {index_name}")
+    for i in progress:
         window_start = max(0, i - MAX_BARS_BACK + 1)
-        window_features = full_features.iloc[window_start:i + 1]
-        window_close = full_df['close'].iloc[window_start:i + 1].values
-        precalc_data = {
-            'features': window_features,
-            'prediction': predict_labels_single(window_features.values, window_close, i - window_start),
-            'bullish': full_bullish.iloc[i],
-            'bearish': full_bearish.iloc[i],
-            'atr': full_atr[window_start:i + 1]
+        precalc_slice = {
+            'features': precomp['features'][window_start:i + 1],
+            'prediction': predict_labels_single(precomp['features'][window_start:i + 1], precomp['close'][window_start:i + 1], i - window_start),
+            'bullish': precomp['bullish'][i],
+            'bearish': precomp['bearish'][i],
+            'atr': precomp['atr'][window_start:i + 1],
+            'adx': precomp['adx'][i] if USE_ADX_FILTER else 0,
+            'ema': precomp['ema'][i] if USE_EMA_FILTER else np.inf,
+            'sma': precomp['sma'][i] if USE_SMA_FILTER else np.inf,
+            'high': precomp['high'][window_start:i + 1],
+            'low': precomp['low'][window_start:i + 1],
+            'close': precomp['close'][window_start:i + 1]
         }
         sim_df = full_df.iloc[window_start:i + 1]
-        process_symbol(idx, backtest_state, None, mode='backtest', trade_recorder=trade_recorder, df=sim_df,
-                       precalc_data=precalc_data)
-        if DEBUG and (i % 100 == 0):
-            print(f"[BACKTEST] Processed {i - test_start} candles for {index_name}...")
+        process_symbol(idx, backtest_state, None, mode='backtest', trade_recorder=trade_recorder, df=sim_df, precalc_data=precalc_slice)
 
     if os.path.exists(f"backtest_signal_state_{index_name}.json"):
         os.remove(f"backtest_signal_state_{index_name}.json")
 
-    if DEBUG:
-        print(f"[BACKTEST] Completed backtest for {index_name}")
+    print(f"[BACKTEST] Completed backtest for {index_name}")
     return index_name, trade_recorder
-
 
 def save_backtest_results(all_results):
     output_dir = "backtest_results"
@@ -715,9 +707,7 @@ def save_backtest_results(all_results):
         })
     if summary_data:
         pd.DataFrame(summary_data).to_csv(f"{output_dir}/backtest_summary_{timestamp}.csv", index=False)
-    if DEBUG:
-        print(f"[BACKTEST] Results saved to {output_dir}/backtest_summary_{timestamp}.csv")
-
+    print(f"[BACKTEST] Results saved to {output_dir}/backtest_summary_{timestamp}.csv")
 
 # === Live Trading Functions ===
 
@@ -749,12 +739,10 @@ def fetch_ohlc(symbol, interval=15, months=5):
     df = df[['open', 'high', 'low', 'close']].astype(float)
     return df.sort_index()
 
-
 def is_market_closed():
     now = datetime.now()
     market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
     return now >= market_close
-
 
 def wait_for_market_open():
     while True:
@@ -776,7 +764,6 @@ def wait_for_market_open():
         seconds = int(time_to_open % 60)
         print(f"[INFO] Market opens at 9:15 AM. Waiting {hours}h {minutes}m {seconds}s...")
         time.sleep(30)
-
 
 def run_live_trading(signal_state, trader):
     if not wait_for_market_open():
@@ -808,10 +795,7 @@ def run_live_trading(signal_state, trader):
         all_symbols = [int(list(idx.keys())[0]) for idx in indices]
         try:
             quote_response = dhan_object.quote_data({"IDX_I": all_symbols})
-            quotes = quote_response['data']['data']['IDX_I'] if 'data' in quote_response and 'data' in quote_response[
-                'data'] and 'IDX_I' in quote_response['data']['data'] else {}
-            if DEBUG:
-                print("[LIVE] Fetched quotes successfully")
+            quotes = quote_response['data']['data']['IDX_I'] if 'data' in quote_response and 'data' in quote_response['data'] and 'IDX_I' in quote_response['data']['data'] else {}
         except Exception as e:
             print(f"[ERROR] Error fetching quotes: {e}")
             quotes = {}
@@ -822,8 +806,6 @@ def run_live_trading(signal_state, trader):
                 try:
                     symbol, index = next(iter(index_dict.items()))
                     process_symbol(index_dict, signal_state, trader, quotes.get(symbol), mode='live')
-                    if DEBUG:
-                        print(f"[LIVE] Processed {index} successfully")
                 except Exception as e:
                     print(f"[ERROR] Error processing {index}: {str(e)}")
 
@@ -831,17 +813,14 @@ def run_live_trading(signal_state, trader):
             threads.append(thread)
             thread.start()
 
-        # Wait for all threads to complete
         for thread in threads:
             thread.join()
 
         next_run = get_next_candle_time()
         sleep_duration = (next_run - datetime.now()).total_seconds()
         if sleep_duration > 0:
-            print(
-                f"\n[INFO] 🕒 Next run at {next_run.strftime('%H:%M:%S')}. Sleeping for {int(sleep_duration)} seconds...\n")
+            print(f"\n[INFO] 🕒 Next run at {next_run.strftime('%H:%M:%S')}. Sleeping for {int(sleep_duration)} seconds...\n")
             time.sleep(sleep_duration)
-
 
 def get_next_candle_time(interval=15):
     now = datetime.now()
@@ -852,7 +831,6 @@ def get_next_candle_time(interval=15):
     candles_passed = int(minutes_since_open // interval)
     next_candle_close = market_open + timedelta(minutes=(candles_passed + 1) * interval)
     return next_candle_close + timedelta(seconds=30)
-
 
 # === Main Entry Point ===
 
@@ -865,7 +843,6 @@ if __name__ == '__main__':
     dhan_object = dhanhq.dhanhq(CLIENT_ID, ACCESS_TOKEN)
 
     import sys
-
     if len(sys.argv) > 1:
         if sys.argv[1] == 'backtest':
             print("[INFO] Running in BACKTEST mode...")
